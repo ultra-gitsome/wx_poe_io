@@ -1,0 +1,1364 @@
+# Declare the package
+package POE::Component::WxPoeIO;
+use strict;
+use warnings;
+
+# Initialize our version
+our $VERSION = '0.001001';
+
+# Import what we need from the POE namespace
+use POE;
+
+# Other miscellaneous modules
+use Carp;
+
+# Set some constants
+BEGIN {
+	# Debug fun!
+	if ( ! defined &DEBUG ) {
+		eval "sub DEBUG () { 0 }";
+	}
+}
+
+# Setup IO process
+sub new {
+	# Get the OOP's type
+	my $type = shift;
+
+	# Sanity checking
+	if ( @_ & 1 ) {
+		croak( 'POE::Component::WxPoeIO->new needs even number of options' );
+	}
+
+	# The options hash
+	my %opt = @_;
+
+	# Our own options
+	my ( $ALIAS, $SIGNAL_KEYS, $QUEUE );
+
+	# Get the session alias
+	if ( exists $opt{ALIAS} ) {
+		$ALIAS = $opt{ALIAS};
+		delete $opt{ALIAS};
+	} else {
+		# Debugging info...
+		if ( DEBUG ) {
+			warn 'Using default ALIAS = WxPoeIO';
+		}
+
+		# Set the default
+		$ALIAS = 'WxPoeIO';
+	}
+	if ( exists $opt{SIGNAL_QUEUE} ) {
+		$QUEUE = $opt{SIGNAL_QUEUE};
+		delete $opt{SIGNAL_QUEUE};
+	} else {
+		# Debugging info...
+		if ( DEBUG ) {
+			warn 'No signal queue imported. Generating an array pointer.\n\tExport using EXPORT_SIG_QUEUE_PTR';
+		}
+		# Set an empty array pointer
+		$QUEUE = [];
+	}
+	
+	# Get the signal keys defined by root script
+	# These are held constant between Poe session and Wx frames
+	if ( exists $opt{'SIGNAL_KEYS'} ) {
+		$SIGNAL_KEYS = $opt{'SIGNAL_KEYS'};
+		delete $opt{'SIGNAL_KEYS'};
+
+		# Check if it is defined
+		if ( !$SIGNAL_KEYS or $SIGNAL_KEYS!~/HASH/i ) {
+			# reset $SIGNAL_KEYS to be only undef
+			$SIGNAL_KEYS = undef;
+		}
+	} else {
+		# Set signals to undefined because no key constants have been sent
+		$SIGNAL_KEYS = undef;
+	}
+
+	# Anything left over is unrecognized
+	if ( DEBUG ) {
+		if ( keys %opt > 0 ) {
+			croak 'Unrecognized options were present in POE::Component::WxPoeIO->new -> ' . join( ', ', keys %opt );
+		}
+	}
+
+	# Create a new session for ourself
+	POE::Session->create(
+		# Our subroutines
+		'inline_states'	=>	{
+			# Maintenance events
+			'_start'	=>	\&StartIO,
+			'_stop'		=>	sub {},
+
+			# Config a signal [key] push for use...this is not the same as registing for a signal broadcast
+			'CONFIG_SIGNAL'	=>	\&Config_signal,
+
+			# Register an IO session
+			'REGISTER_SESSION'	=>	\&Register_session,
+
+			# Unregister an IO session
+			'UNREGISTER_SESSION'	=>	\&UnRegister_session,
+
+			# Register an IO frame
+			'REGISTER_FRAME'	=>	\&Register_frame,
+
+			# Unregister an IO frame
+			'UNREGISTER_FRAME'	=>	\&UnRegister_frame,
+
+			# Register a wxframe to wxframe IO on FRAME_TO_FRAME channel
+			'REGISTER_FRAME_TO_FRAME'	=>	\&Register_frame_to_frame,
+
+			# Trigger signals
+			'TRIGGER_SIGNALS'		=>	\&trigger_signals,
+
+			# Terminate signal and clean up state
+			'END_SIGNAL'		=>	\&end_signal,
+
+			# SIGNAL SOMETHING to POE!
+			'TO_POE'		=>	\&toPoe,
+			# SIGNAL SOMETHING to WxFrame!
+			'TO_WX'			=>	\&toWx,
+
+			# Manage POE SIGNAL
+			'_MANAGE_LATCHING'	=>	\&_manage_latching,
+
+			# Manage POE SIGNAL
+			'_MANAGE_TO_POE'	=>	\&_manage_to_poe,
+
+			# Wait loop for latched POE SIGNAL
+			'_WAIT_ON_LATCH'	=>	\&_wait_on_latch,
+
+			# Wait loop for locked POE SIGNAL
+			'_WAIT_TO_POE'	=>	\&_wait_to_poe,
+
+			# export method to obtain the pointer to the signal queue
+			'EXPORT_SIG_QUEUE_PTR' => \&export_queue_ptr,
+			
+			# We are done!
+			'SHUTDOWN'	=>	\&StopIO,
+		},
+
+		# Set up the heap for ourself
+		'heap'		=>	{
+			'ALIAS'		=>	$ALIAS,
+
+			# The session registation table
+			'WXPOEIO'	=>	{},
+
+			# SIGNAL_KEYS
+			'SIGNAL_KEYS'	=>	$SIGNAL_KEYS,
+
+			# The frame registration table
+			'WXFRAMEIO'	=>	{},
+
+			# The channel registration table
+			'WXPOEIO_CHANNELS'	=>	{'MAIN'=>1},
+
+			# The channel registration table
+			'WXPOEIO_QUEUE'	=>	$QUEUE,
+		},
+	) or die 'Unable to create a new session!';
+
+	# Return success
+	return 1;
+}
+
+# Configure a new io signal for latching and locking
+sub Config_signal {
+	# Get the arguments
+	my $args = $_[0];
+
+	my %loc_args = ('SIGNAL_CHANNEL'=>'MAIN','LATCH'=>1,'TIMEOUT'=>0,'LOCK'=>0,'RETRIES'=>100);
+
+	# Validation - silently ignore errors
+	if ( ! defined $args->{SIGNAL_KEY} ) {
+		if ( DEBUG ) {
+			warn 'Did not get any arguments';
+		}
+		return undef;
+	}
+
+	if ( ! defined $args->{SIGNAL_CHANNEL} ) {
+		if ( DEBUG ) {
+			warn "Did not get a signal channel for signal: ".$args->{SIGNAL_KEY}." - using default [MAIN] channel";
+		}
+	}
+	if ( exists $args->{SIGNAL_CHANNEL} and $args->{SIGNAL_CHANNEL} ) {
+		$loc_args{SIGNAL_CHANNEL} = $args->{SIGNAL_CHANNEL};
+	}
+	if ( exists $args->{LATCH} and !$args->{LATCH} ) {
+		$loc_args{LATCH} = 0;
+	}
+	if ( exists $args->{TIMEOUT} and $args->{TIMEOUT} ) {
+		$loc_args{TIMEOUT} = $args->{TIMEOUT};
+	}
+	if ( exists $args->{LOCK} and $args->{LOCK} ) {
+		$loc_args{LOCK} = 1;
+	}
+	if ( exists $args->{RETRIES} ) {
+		$loc_args{RETRIES} = $args->{RETRIES};
+		# Force falsy state to be an integer 0
+		if(!$loc_args{RETRIES}) {
+			$loc_args{RETRIES} = 0;
+		}
+	}
+
+	if ( !exists $_[HEAP]->{SIGNAL_KEYS}->{ $args->{SIGNAL_KEY} } ) {
+		warn 'Setting undefined SIGNAL KEY ['.$args->{SIGNAL_KEY}.']. Possible void context.';
+		if ( DEBUG ) {
+			warn 'Signal key ['.$args->{SIGNAL_KEY}.'] not properly initialized';
+		}
+	}
+	$_[HEAP]->{SIGNAL_KEYS}->{ $args->{SIGNAL_KEY} }->{WXPOEIO_CHANNEL} = $loc_args{SIGNAL_CHANNEL};
+	$_[HEAP]->{SIGNAL_KEYS}->{ $args->{SIGNAL_KEY} }->{LATCH} = $loc_args{LATCH};
+	$_[HEAP]->{SIGNAL_KEYS}->{ $args->{SIGNAL_KEY} }->{LOCK} = $loc_args{LOCK};
+	$_[HEAP]->{SIGNAL_KEYS}->{ $args->{SIGNAL_KEY} }->{TIMEOUT} = $loc_args{TIMEOUT};
+	$_[HEAP]->{SIGNAL_KEYS}->{ $args->{SIGNAL_KEY} }->{RETRIES} = $loc_args{RETRIES};
+	$_[HEAP]->{SIGNAL_KEYS}->{ $args->{SIGNAL_KEY} }->{IS_LATCHED} = 0;
+	if ( !exists $_[HEAP]->{WXPOEIO_CHANNELS}->{ $loc_args{SIGNAL_CHANNEL} } ) {
+		$_[HEAP]->{WXPOEIO_CHANNELS}->{ $loc_args{SIGNAL_CHANNEL} } = {};
+	}
+	$_[HEAP]->{WXPOEIO_CHANNELS}->{ $loc_args{SIGNAL_CHANNEL} }->{IS_LOCKED} = 0;
+	$_[HEAP]->{WXPOEIO_CHANNELS}->{ $loc_args{SIGNAL_CHANNEL} }->{IS_NOISY} = 0;
+	$_[HEAP]->{WXPOEIO_CHANNELS}->{ $loc_args{SIGNAL_CHANNEL} }->{NOISE} = undef;
+
+	# Config complete!
+	return 1;
+}
+
+# Register a session to watch/wait for io signal
+sub Register_session {
+	# Get the arguments
+	my $args = $_[0];
+
+	# Validation - silently ignore errors
+	if ( ! defined $args->{SIGNAL_KEY} ) {
+		if ( DEBUG ) {
+			warn 'Did not get any arguments';
+		}
+		return undef;
+	}
+
+	if ( ! defined $args->{SESSION} ) {
+		if ( DEBUG ) {
+			warn "Did not get a TargetSession for SignalKey: ".$args->{SIGNAL_KEY};
+		}
+		return undef;
+	} else {
+		# Convert actual POE::Session objects to their ID
+		if ( UNIVERSAL::isa( $args->{SESSION}, 'POE::Session') ) {
+			$args->{SESSION} = $args->{SESSION}->ID;
+		}
+	}
+	if ( ! defined $args->{EVT_METHOD} ) {
+		if ( DEBUG ) {
+			warn "Did not get an EvtMethod for SignalKey: ".$args->{SIGNAL_KEY}." and Target Session: ".$args->{SESSION};
+		}
+		return undef;
+	}
+
+#	# register within the WXPOEIO hash structure
+	if ( ! exists $_[HEAP]->{WXPOEIO}->{ $args->{SIGNAL_KEY} } ) {
+		$_[HEAP]->{WXPOEIO}->{ $args->{SIGNAL_KEY} } = {};
+	}
+
+	if ( ! exists $_[HEAP]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} } ) {
+			$_[HEAP]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} } = {};
+	}
+
+	# Finally store the event method in the signal key hash
+	if ( exists $_[HEAP]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{ $args->{EVT_METHOD} } ) {
+		# Duplicate record...
+		if ( DEBUG ) {
+			warn "Tried to register a duplicate! -> LogName: ".$args->{SIGNAL_KEY}." -> Target Session: ".$args->{SESSION}." -> Event: ".$args->{EVT_METHOD};
+		}
+	} else {
+		$_[HEAP]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{ $args->{EVT_METHOD} } = 1;
+	}
+
+	# All registered!
+	return 1;
+}
+
+# Delete a watcher session
+sub UnRegister_session {
+	# Get the arguments
+	my $args = $_[0];
+
+	# Validation - silently ignore errors
+	if ( ! defined $args->{SIGNAL_KEY} ) {
+		if ( DEBUG ) {
+			warn 'Did not get any arguments';
+		}
+		return undef;
+	}
+	if ( ! defined $args->{SESSION} ) {
+		if ( DEBUG ) {
+			warn "Did not get a TargetSession for SignalKey: ".$args->{SIGNAL_KEY};
+		}
+		return undef;
+	} else {
+		# Convert actual POE::Session objects to their ID
+		if ( UNIVERSAL::isa( $args->{SESSION}, 'POE::Session') ) {
+			$args->{SESSION} = $args->{SESSION}->ID;
+		}
+	}
+
+	if ( ! defined $args->{EVT_METHOD} ) {
+		if ( DEBUG ) {
+			warn "Did not get an EvtMethod for SignalKey: ".$args->{SIGNAL_KEY}." and Target Session: ".$args->{SESSION};
+		}
+		return undef;
+	}
+
+	# Search through the registrations for this specific one
+	if ( exists $_[HEAP]->{WXPOEIO}->{ $args->{SIGNAL_KEY} } ) {
+		# Scan it for targetsession
+		if ( exists $_[HEAP]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} } ) {
+			# Scan for the proper event!
+			foreach my $evt_meth ( keys %{ $_[HEAP]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} } } ) {
+				if ( $evt_meth eq $args->{EVT_METHOD} ) {
+					# Found a match, delete it!
+					delete $_[HEAP]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{ $evt_meth };
+					if ( scalar keys %{ $_[HEAP]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} } } == 0 ) {
+						delete $_[HEAP]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} };
+					}
+
+					# Return success
+					return 1;
+				}
+			}
+		}
+	}
+
+	# Found nothing...
+	return undef;
+}
+
+# Register a wxframe to watch/wait for io signal
+sub Register_frame {
+	# Get the arguments
+	my $args = $_[0];
+
+	# Validation - silently ignore errors
+	if ( ! defined $args->{SIGNAL_KEY} ) {
+		if ( DEBUG ) {
+			warn 'Did not get any arguments';
+		}
+		return undef;
+	}
+	my $frame = 'DEFAULT';
+	if ( exists $args->{WXFRAME_IDENT} ) {
+		$frame = $args->{WXFRAME_IDENT};
+	}
+	if ( ! defined $frame ) {
+		if ( DEBUG ) {
+			warn "Did not get a valid frame name for SignalKey: ".$args->{SIGNAL_KEY}," and wxFrame Object: ".$args->{WXFRAME_OBJ};
+		}
+		return undef;
+	}
+	if ( ! defined $args->{WX_METHOD} ) {
+		if ( DEBUG ) {
+			warn "Did not get an WxMethod for SignalKey: ".$args->{SIGNAL_KEY}." and wxFrame Object: ".$args->{WXFRAME_OBJ};
+		}
+		return undef;
+	}
+	my $wxframe_mgr = 0;
+	if ( exists $args->{WXFRAME_MGR_TOGGLE} ) {
+		$wxframe_mgr = $args->{WXFRAME_MGR_TOGGLE};
+	}
+	# require either the use of a wxframe manager or the pointer to the wxframe object
+	if ( ! defined $args->{WXFRAME_OBJ} and !$wxframe_mgr ) {
+		if ( DEBUG ) {
+			warn "Did not get a WxFrame Object for SignalKey: ".$args->{SIGNAL_KEY};
+		}
+		return undef;
+	}
+
+
+	# register within the WXPOEIO hash structure
+	if ( ! exists $_[HEAP]->{WXFRAMEIO}->{$frame} ) {
+		$_[HEAP]->{WXFRAMEIO}->{$frame} = {};
+	}
+
+	if ( ! exists $_[HEAP]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} } ) {
+		$_[HEAP]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} } = {};
+	}
+
+	# Finally store the wx method in the signal key hash
+	$_[HEAP]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} }->{WX_METHOD} = $args->{WX_METHOD};
+
+	# set USE_WXFRAME_MGR to falsy as default
+	$_[HEAP]->{WXFRAMEIO}->{$frame}->{USE_WXFRAME_MGR} = 0; 
+	if($wxframe_mgr) {
+		$_[HEAP]->{WXFRAMEIO}->{WXSIGHANDLE}->{$frame}->{USE_WXFRAME_MGR} = 1; 
+	} else {
+		$_[HEAP]->{WXFRAMEIO}->{WXSIGHANDLE}->{$frame}->{WXFRAME_OBJ} = $args->{WXFRAME_OBJ};
+	}
+
+	# All registered!
+	return 1;
+}
+
+# Delete a watcher frame
+sub UnRegister_frame {
+	# Get the arguments
+	my $args = $_[0];
+
+	# Validation - silently ignore errors
+	if ( ! defined $args->{SIGNAL_KEY} ) {
+		if ( DEBUG ) {
+			warn 'Did not get any arguments';
+		}
+		return undef;
+	}
+	my $frame = 'DEFAULT';
+	if ( exists $args->{WXFRAME_IDENT} ) {
+		$frame = $args->{WXFRAME_IDENT};
+	}
+	if ( ! defined $frame ) {
+		if ( DEBUG ) {
+			warn "Did not get a valid frame name for SignalKey: ".$args->{SIGNAL_KEY}." and wxFrame Object: ".$args->{WXFRAME_OBJ};
+		}
+		return undef;
+	}
+	if ( ! defined $args->{WX_METHOD} ) {
+		if ( DEBUG ) {
+			warn "Did not get an WxMethod for SignalKey: ".$args->{SIGNAL_KEY}." and wxFrame Object: ".$args->{WXFRAME_OBJ};
+		}
+		return undef;
+	}
+
+	# Search through the registrations for this specific one
+	if ( exists $_[HEAP]->{WXFRAMEIO}->{$frame} ) {
+		# Scan it for signal key
+		if ( exists $_[HEAP]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} } ) {
+			# Scan for the proper event!
+			foreach my $evt_meth ( keys %{ $_[HEAP]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} } } ) {
+				if ( $evt_meth eq $args->{WX_METHOD} ) {
+					# Found a match, delete it!
+					delete $_[HEAP]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} }->{ $evt_meth };
+					if ( scalar keys %{ $_[HEAP]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} } } == 0 ) {
+						delete $_[HEAP]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} };
+						if ( scalar keys %{ $_[HEAP]->{WXFRAMEIO}->{$frame} } == 0 ) {
+							delete $_[HEAP]->{WXFRAMEIO}->{$frame};
+							if( exists $_[HEAP]->{WXFRAMEIO}->{WXSIGHANDLE}->{$frame}->{USE_WXFRAME_MGR} ) {
+								delete $_[HEAP]->{WXFRAMEIO}->{WXSIGHANDLE}->{$frame}->{USE_WXFRAME_MGR};
+							}
+							if( exists $_[HEAP]->{WXFRAMEIO}->{WXSIGHANDLE}->{$frame}->{WXFRAME_OBJ} ) {
+								delete $_[HEAP]->{WXFRAMEIO}->{WXSIGHANDLE}->{$frame}->{WXFRAME_OBJ};
+							}
+							if ( scalar keys %{ $_[HEAP]->{WXFRAMEIO}->{WXSIGHANDLE}->{$frame} } == 0 ) {
+								delete $_[HEAP]->{WXFRAMEIO}->{WXSIGHANDLE}->{$frame};
+							}
+						}
+					}
+
+					# Return success
+					return 1;
+				}
+			}
+		}
+	}
+
+	# Found nothing...
+	return undef;
+}
+
+# Register a frame to receive a signal on the FRAME_TO_FRAME channel (minimal latency between receipt and delivery)
+sub Register_frame_to_frame {
+	# Get the arguments
+	my $args = $_[0];
+
+	# Validation - silently ignore errors
+	if ( ! defined $args->{SIGNAL_KEY} ) {
+		if ( DEBUG ) {
+			warn 'Did not get any arguments';
+		}
+		return undef;
+	}
+	my $frame = 'DEFAULT';
+	if ( exists $args->{WXFRAME_IDENT} ) {
+		$frame = $args->{WXFRAME_IDENT};
+	}
+	if ( ! defined $frame ) {
+		if ( DEBUG ) {
+			warn "Did not get a valid frame name for SignalKey: ".$args->{SIGNAL_KEY}." and wxFrame Object: ".$args->{WXFRAME_OBJ};
+		}
+		return undef;
+	}
+	if ( ! defined $args->{WX_METHOD} ) {
+		if ( DEBUG ) {
+			warn "Did not get an WxMethod for SignalKey: ".$args->{SIGNAL_KEY}." and wxFrame Object: ".$args->{WXFRAME_OBJ};
+		}
+		return undef;
+	}
+	my $wxframe_mgr = 0;
+	if ( exists $args->{WXFRAME_MGR_TOGGLE} ) {
+		$wxframe_mgr = $args->{WXFRAME_MGR_TOGGLE};
+	}
+	# require either the use of a wxframe manager or the pointer to the wxframe object
+	if ( ! defined $args->{WXFRAME_OBJ} and !$wxframe_mgr ) {
+		if ( DEBUG ) {
+			warn "Did not get a WxFrame Object for SignalKey: ".$args->{SIGNAL_KEY};
+		}
+		return undef;
+	}
+
+	# register within the WXPOEIO hash structure
+	if ( ! exists $_[HEAP]->{WXFRAMEIO}->{$frame} ) {
+		$_[HEAP]->{WXFRAMEIO}->{$frame} = {};
+	}
+
+	if ( ! exists $_[HEAP]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} } ) {
+		$_[HEAP]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} } = {};
+	}
+
+	# Finally store the wx method in the signal key hash
+	$_[HEAP]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} }->{WX_METHOD} = $args->{WX_METHOD};
+
+	# set USE_WXFRAME_MGR to falsy as default
+	$_[HEAP]->{WXFRAMEIO}->{$frame}->{USE_WXFRAME_MGR} = 0; 
+	if($wxframe_mgr) {
+		$_[HEAP]->{WXFRAMEIO}->{WXSIGHANDLE}->{$frame}->{USE_WXFRAME_MGR} = 1; 
+	} else {
+		$_[HEAP]->{WXFRAMEIO}->{WXSIGHANDLE}->{$frame}->{WXFRAME_OBJ} = $args->{WXFRAME_OBJ};
+	}
+
+	$_[HEAP]->{SIGNAL_KEYS}->{ $args->{SIGNAL_KEY} }->{WXPOEIO_CHANNEL} = 'FRAME_TO_FRAME';
+	$_[HEAP]->{SIGNAL_KEYS}->{ $args->{SIGNAL_KEY} }->{LATCH} = 0;
+	if ( !exists $_[HEAP]->{WXPOEIO_CHANNELS}->{FRAME_TO_FRAME} ) {
+		$_[HEAP]->{WXPOEIO_CHANNELS}->{FRAME_TO_FRAME} = {};
+	}
+
+	# All registered!
+	return 1;
+}
+
+# Where the work is queued...
+sub trigger_signals {
+
+	if ( exists $_[HEAP]->{WXPOEIO_QUEUE} ) {
+		my $sq = $_[HEAP]->{WXPOEIO_QUEUE};
+		if($sq!~/ARRAY/i) {
+			if ( DEBUG ) {
+				warn "The siqnal queue pointer is corrupt: [$sq]. Will not trigger signals";
+			}
+			return undef;
+		}
+		while( scalar(@$sq) ) {
+			my $signal = shift @$sq;
+
+			if($signal!~/HASH/i) {
+				if ( DEBUG ) {
+					warn "The siqnal hash pointer is corrupt: [$signal]. Cannot determine signal key and value";
+				}
+				next;
+			}
+			foreach my $sigkey (keys %$signal) {
+				my $sigvalue = $signal->{$sigkey};
+				if( !exists $_[HEAP]->{SIGNAL_KEYS}->{$sigkey}) {
+					# silent fail...skip signal key
+					next;
+				}
+				if( exists $_[HEAP]->{WXPOEIO_CHANNELS}->{FRAME_TO_FRAME}) {
+					# check signal key against FRAME_TO_FRAME channel
+					if($_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{WXPOEIO_CHANNEL} eq 'FRAME_TO_FRAME') {
+						$_[KERNEL]->yield('TO_WX', $sigkey, $sigvalue);
+						next;
+					}
+				}
+				$_[KERNEL]->yield('TO_POE', $sigkey, $sigvalue);
+			}
+			if(!scalar(@$sq)) {
+				last;
+			}
+		}
+		# signal queue is empty!
+		return 1;
+	}
+	# silently fail falsy...tho, some notice should be given
+	return 0;
+}
+	
+# Where the work is done...
+sub toPoe {
+	# ARG0 = signal_key, ARG1 = signal_value
+	my( $sigkey, $sigvalue ) = @_[ ARG0, ARG1 ];
+
+	# Search for this signal!
+	if ( exists $_[HEAP]->{WXPOEIO}->{ $sigkey } ) {
+
+		# Test for signal latch
+		# (latching restricts follow on signal calls until task has been completed)
+
+		# Test for whether a latch has been specified for the signal call
+		if ( !exists $_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{LATCH} or !$_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{LATCH} ) {
+			$_[KERNEL]->yield('_MANAGE_TO_POE', $sigkey, $sigvalue);
+		}
+		
+		# Latching is expected
+		# Test for whether the signal call has been latched
+		if ( !exists $_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{IS_LATCHED}  or !$_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{IS_LATCHED}) {
+			# no latch; set latch and continue to POE
+			$_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{IS_LATCHED} = 1;
+			$_[KERNEL]->yield('_MANAGE_TO_POE', $sigkey, $sigvalue);
+		}
+
+		$_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{WAIT_LATCH} = 1;
+		$_[KERNEL]->yield('_WAIT_ON_LATCH', $sigkey, $sigvalue);
+
+	} else {
+		# Ignore this signalkey
+		if ( DEBUG ) {
+			warn "Got this Signal_key: [$sigkey] -> Ignoring it because it is not registered";
+		}
+	}
+
+	# All done!
+	return 1;
+}
+
+# Where the work is finished...
+sub end_signal {
+	# ARG0 = signal_key, ARG1 = signal_value, [Optional, ARG2 = _wxframe_manager]
+	my( $sigkey, $sigvalue, $_wfmgr ) = @_[ ARG0, ARG1, ARG2 ];
+
+	# Search for this signal!
+	if ( exists $_[HEAP]->{WXPOEIO}->{ $sigkey } ) {
+
+		# clear all latch, locks and noise for signal
+		my $channel = $_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{WXPOEIO_CHANNEL};
+
+		$_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{IS_LATCHED} = 0;
+		$_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{IS_LOCKED} = 0;
+
+		if ( exists $_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{NOISE}->{$sigkey} ) {
+			delete $_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{NOISE}->{$sigkey};
+		}
+		
+		if ( scalar keys %{ $_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{NOISE} } == 0 ) {
+			$_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{IS_NOISY} = 0;
+		}
+	} else {
+		if ( DEBUG ) {
+			warn "Terminating an unregistered signal. Opps! [$sigkey]";
+		}
+	}
+	
+	if( defined $_wfmgr) {
+		$_[KERNEL]->yield('TO_WX', $sigkey, $sigvalue, $_wfmgr);
+	} else {
+		$_[KERNEL]->yield('TO_WX', $sigkey, $sigvalue);
+	}
+	# signal set to wxframe, close loop
+	return 1;
+}
+
+# Where EVEN MORE work is done...
+sub toWx {
+	# ARG0 = signal_key, ARG1 = signal_value, [Optional, ARG2 = _wxframe_manager]
+	my( $sigkey, $sigvalue, $_wfmgr ) = @_[ ARG0, ARG1, ARG2 ];
+
+	# Search through the registrations for this specific one
+	foreach my $wxframe ( keys %{ $_[HEAP]->{WXFRAMEIO} } ) {
+		# Scan frame key for signal key
+		if ( exists $_[HEAP]->{WXFRAMEIO}->{$wxframe}->{$sigkey} ) {
+			# Scan for the proper evt_method!
+			foreach my $evt_meth ( keys %{ $_[HEAP]->{WXFRAMEIO}->{$wxframe}->{$sigkey} } ) {
+
+				if ( exists $_[HEAP]->{WXFRAMEIO}->{WXSIGHANDLE}->{$wxframe}->{USE_WXFRAME_MGR} ) {
+					$_wfmgr->$evt_meth( $sigkey,$sigvalue );
+					return 1;
+				}
+				if ( exists $_[HEAP]->{WXFRAMEIO}->{WXSIGHANDLE}->{$wxframe}->{WXFRAME_OBJ} ) {
+					my $wxframe_obj = $_[HEAP]->{WXFRAMEIO}->{WXSIGHANDLE}->{$wxframe}->{WXFRAME_OBJ};
+					$wxframe_obj->$evt_meth( $sigkey,$sigvalue );
+					return 1;
+				}
+				## else, fail silently...nothing is return to the wxframe
+			}
+		}
+	}
+	return 1;
+}
+
+# manage the latching here
+sub _manage_latching {
+	# ARG0 = signal_key, ARG1 = signal_value
+	my( $sigkey, $sigvalue ) = @_[ ARG0, ARG1 ];
+
+	if ( exists $_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{IS_LATCHED}  and $_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{IS_LATCHED}) {
+		my $latches = 0;
+		my $timeout = 0;
+		if ( exists $_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{LATCH_ATTEMPTS} ) {
+			$latches = $_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{LATCH_ATTEMPTS};
+		}
+		if ( exists $_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{TIMEOUT} ) {
+			$timeout = $_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{TIMEOUT};
+		}
+		if( $latches > $timeout ) {
+			# reset latch state and continue to Poe
+			$_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{WAIT_LATCH} = 0;
+			$_[KERNEL]->yield('_WAIT_ON_LATCH', $sigkey, $sigvalue);
+			return;
+		}
+		$_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{LATCH_ATTEMPTS} = $_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{LATCH_ATTEMPTS} + 1;
+		$_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{WAIT_LATCH} = 1;
+		$_[KERNEL]->yield('_WAIT_ON_LATCH', $sigkey, $sigvalue);
+		return;
+	}
+	$_[KERNEL]->yield('_MANAGE_TO_POE', $sigkey, $sigvalue);
+	return;
+}
+
+# activate kernel call to the session here
+sub _manage_to_poe {
+	# ARG0 = signal_key, ARG1 = signal_value
+	my( $sigkey, $sigvalue ) = @_[ ARG0, ARG1 ];
+
+	# if signal requires a channel lock, check on lock and channel use (noise)
+	my $channel = 'MAIN'; # default
+	if ( exists $_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{WXPOEIO_CHANNEL}  and $_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{WXPOEIO_CHANNEL}) {
+		$channel = $_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{WXPOEIO_CHANNEL};
+	}
+	if(!$channel) {
+		# rats...something broke
+		if ( DEBUG ) {
+			warn "Darn! Looks like the channel value is null. Please fix!";
+		}
+		return undef;
+	}
+	
+	if ( exists $_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{LOCK}  and $_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{LOCK}) {
+		my $lock = 0;
+		if ( exists $_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{IS_LOCKED}  and $_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{IS_LOCKED}) {
+			$lock = 1;
+		}
+		if ( exists $_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{IS_NOISY}  and $_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{IS_NOISY}) {
+			$lock = 1;
+		}
+		if($lock) {
+			if ( exists $_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{RETRIES}  and $_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{RETRIES}) {
+				if ( !exists $_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{RETRY_ATTEMPTS}) {
+					$_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{RETRY_ATTEMPTS} = 0;
+				}
+				if( $_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{RETRY_ATTEMPTS} < $_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{RETRIES} ) {
+					$_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{RETRY_ATTEMPTS} = $_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{RETRY_ATTEMPTS} + 1;
+					$_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{WAIT_LOCK} = 1;
+					$_[KERNEL]->delay('_WAIT_TO_POE' => 1, $sigkey, $sigvalue);
+				}
+				# retry unsuccessful, return falsy
+				return 0;
+			}
+		} else {
+			$_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{WAIT_LOCK} = 0;
+			$_[KERNEL]->delay('_WAIT_TO_POE' => undef, $sigkey, $sigvalue);
+			$_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{RETRY_ATTEMPTS} = 0;
+			$_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{IS_LOCKED} = 1;
+#			return;
+		}
+	}
+	$_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{IS_NOISY} = 1;
+	$_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{NOISE}->{$sigkey} = 1;
+
+	my $valid_sessions = 0;
+	# Now, loop over each targetsession, checking if it is valid
+	foreach my $TargetSession ( keys %{ $_[HEAP]->{WXPOEIO}->{ $sigkey } } ) {
+		# Find out if this session exists
+		if ( ! $_[KERNEL]->ID_id_to_session( $TargetSession ) ) {
+			# rats...:)
+			if ( DEBUG ) {
+				warn "TargetSession ID $TargetSession does not exist";
+			}
+		} else {
+			# Send to event methods
+			foreach my $evt_meth ( keys %{ $_[HEAP]->{WXPOEIO}->{ $sigkey }->{ $TargetSession } } ) {
+				# We call event methods with 2 arguments
+				# ARG0 -> SIGNAL_KEY
+				# ARG1 -> SIGNAL_VALUE (message)
+				$_[KERNEL]->post(	$TargetSession,
+								$evt_meth,
+								$sigkey,
+								$sigvalue,
+					);
+			}
+			$valid_sessions++;
+		}
+	}
+	if($valid_sessions) {
+		# Return success
+		return 1;
+	}
+
+	# no signals sent, so fix settings and return falsy...
+	$_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{IS_LATCHED} = 0;
+	if ( exists $_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{NOISE}->{$sigkey} ) {
+		delete $_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{NOISE}->{$sigkey};
+	}
+	if ( scalar keys %{ $_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{NOISE} } == 0 ) {
+		$_[HEAP]->{WXPOEIO_CHANNELS}->{$channel}->{IS_NOISY} = 0;
+	}
+	return 0;
+}
+
+# wait kernel call to session here
+sub _wait_to_poe {
+	# ARG0 = signal_key, ARG1 = signal_value
+	my( $sigkey, $sigvalue ) = @_[ ARG0, ARG1 ];
+
+	if( exists $_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{WAIT_LOCK} and $_[HEAP]->{SIGNAL_KEYS}->{ $sigkey }->{WAIT_LOCK}) {
+		$_[KERNEL]->delay('_MANAGE_TO_POE' => 1, $sigkey, $sigvalue);
+		return 1;
+	}
+	return 1;
+}
+
+# timeout latch here
+sub _wait_on_latch {
+	# ARG0 = signal_key, ARG1 = signal_value
+	my( $sigkey, $sigvalue ) = @_[ ARG0, ARG1 ];
+
+	if( !exists $_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{WAIT_LATCH} and !$_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{WAIT_LATCH}) {
+		$_[HEAP]->{SIGNAL_KEYS}->{$sigkey}->{LATCH_ATTEMPTS} = 0;
+		$_[KERNEL]->yield('_MANAGE_TO_POE', $sigkey, $sigvalue);
+		$_[KERNEL]->delay('_MANAGE_LATCHING' => undef, $sigkey, $sigvalue);
+		return 1;
+	}
+	$_[KERNEL]->delay('_MANAGE_LATCHING' => 1, $sigkey, $sigvalue);
+	return 1;
+}
+
+# Starts the WxPoe IO
+sub StartIO {
+	# Create an alias for ourself
+	$_[KERNEL]->alias_set( $_[HEAP]->{'ALIAS'} );
+
+	# All done!
+	return 1;
+}
+
+# Stops the WxPoe IO
+sub StopIO {
+	# Remove our alias
+	$_[KERNEL]->alias_remove( $_[HEAP]->{'ALIAS'} );
+
+	# Clear our data
+	delete $_[HEAP]->{'WXPOEIO'};
+	delete $_[HEAP]->{'WXFRAMEIO'};
+
+	# All done!
+	return 1;
+}
+
+sub export_queue_ptr {
+	my $queue_var = $_[0];
+	if(!exists $_[HEAP]->{WXPOEIO_QUEUE}) {
+		$_[HEAP]->{WXPOEIO_QUEUE} = [];
+	}
+	$queue_var = $_[HEAP]->{WXPOEIO_QUEUE};
+	return 1;
+}
+
+# End of module
+1;
+
+__END__
+
+=head1 NAME
+
+POE::Component::WxPoeIO - Perl extension to manage a simple signal system for a POE::Loop::Wx event loop.
+
+=head1 CREDITS
+
+This package was derived from the POE::Component::SimpleLog module developed by Apocalypse E<lt>apocal@cpan.orgE<gt>. The formats
+of the WxPoeIO and SimpleLog packages are very similar (not too much creativity on my part). Ed Heil contributed the 'pulse' concept
+code from his Loop:Wx example at http://cpansearch.perl.org/src/MIKE/POE-Loop-Wx-0.03/example/wxpoe2.pl. This package uses Mike 
+Schroeder's Wx extension POE::Loop::Wx. Mike Schroeder <mike-cpan@donorware.com> Ed Heil <ed-cpan@donorware.com. The article,
+POE: Cookbook - Broadcasting Events, was the inspriration and concept source for the signal channel registry.
+
+=head1 SYNOPSIS
+
+	use strict;
+	use POE;
+	use Wx;
+	use POE::Loop::Wx;
+	use POE::Component::WxPoeIO;
+
+	my $wx_poe_App_name = 'MyStarterWxPoe';
+	use MyApp::MyStarterWxPoe;
+
+	my $signal_queue = [];
+
+	# call out some signal keys
+	# these keys must be coordinated between Wx frames and Poe sessions
+	my $signal_keys = {};
+		$signal_keys->{shout_out_hello}	= 1;
+		$signal_keys->{slow_poe}	= 1;
+		$signal_keys->{still_loopy}	= 1;
+		$signal_keys->{ping_thingy}	= 1;
+
+	my $signal_config = {};
+		$signal_config->{shout_out_hello} = {'SIGNAL_CHANNEL'=>'GREETING','LATCH'=>1,'TIMEOUT'=>3};
+		$signal_config->{slow_poe} = {'SIGNAL_CHANNEL'=>'STATUS','LATCH'=>1,'TIMEOUT'=>0,'RETRIES'=>10};
+		$signal_config->{still_loopy} = {'SIGNAL_CHANNEL'=>'STATUS','LATCH'=>1,'TIMEOUT'=>0,'LOCK'=>1,'RETRIES'=>100};
+		$signal_config->{ping_thingy} = {'SIGNAL_CHANNEL'=>'PINGER','LATCH'=>0};
+
+	my $poe_registration = {};
+		$poe_registration->{shout_out_hello}	= {'INIT_NEW'=>'_init_local_call','EVT_METHOD'=>'PhoneHome'};
+		$poe_registration->{slow_poe}	= {'INIT_NEW'=>'_init_local_listener','EVT_METHOD'=>'SendNotice'};
+		$poe_registration->{still_loopy}	= {'INIT_NEW'=>'_init_local_listener','EVT_METHOD'=>'SendNotice'};
+		$poe_registration->{ping_thingy}	= {'INIT_NEW'=>undef,'EVT_METHOD'=>'LogMe'};
+
+	# The signal queue can be fetched later if needed.
+	POE::Component::WxPoeIO->new(
+		ALIAS		=> 'WxPoeIO',
+		SIGNAL_KEYS	=> $signal_keys,
+		SIGNAL_QUEUE	=> $signal_queue,
+	) or die 'Unable to create WsPoeIO';
+
+	package main;
+	my $app = $wx_poe_App_name->new();
+
+	# Within my App structure a wxFrame manager is created to provide a central sourse for common work
+	# not required, but handy
+	my $_wfmgr = $app->wfmgr_handle();
+
+	# Create our own session to communicate with SimpleLog
+	POE::Session->create(
+		inline_states => {
+			_start => sub {
+				# use a init_config state to organized initial setup
+				$_[KERNEL]->yield('init_config');
+
+				# start the Heil pulse
+				$_[KERNEL]->yield('pulse');
+
+			},
+			init_config => sub {
+
+				# Configure the signal based on $signal_config (or other user method)
+				foreach my $sigkey (keys %$signal_keys) {
+					my $sig_args = $signal_config->{$sigkey};
+					$sig_args->{$sigkey} = 1;
+					$_[KERNEL]->post( 'WxPoeIO', 'CONFIG_SIGNAL', $sig_args);
+				}
+				
+				if ( @AppControl::frames ) {
+					foreach ( @AppControl::frames ) {
+						my $fid = $_->frameIdent();
+						if( !defined $signal_queue) {
+							$_[KERNEL]->post( 'WxPoeIO', 'EXPORT_SIG_QUEUE_PTR', $signal_queue);
+						}
+						$_->signalQueuePtr($signal_queue);
+						$_->init_wxframe_main($_wfmgr);
+						if( !defined $_wfmgr) {
+							my $frame_reg = $_->get_frame_registrations();
+							if(defined $frame_reg) {
+								foreach my $sigkey (keys %$frame_reg) {
+									my $sig_args = $frame_reg->{$sigkey};
+									$sig_args->{$sigkey} = 1;
+									$sig_args->{WXFRAME_OBJ} = $_;
+									$_[KERNEL]->post( 'WxPoeIO', 'REGISTER_FRAME', $sig_args);
+								}
+							}
+						}
+					}
+					if( defined $_wfmgr) {
+						my $frame_reg = $_wfmgr->get_frame_registrations();
+						if(defined $frame_reg) {
+							foreach my $sigkey (keys %$frame_reg) {
+								my $sig_args = $frame_reg->{$sigkey};
+								$sig_args->{$sigkey} = 1;
+								$sig_args->{WXFRAME_MGR_TOGGLE} = 1;
+								$_[KERNEL]->post( 'WxPoeIO', 'REGISTER_FRAME', $sig_args);
+							}
+						}
+					}
+				}
+				foreach my $sigkey (keys %$poe_registration) {
+					my $sig_args = $poe_registration->{$sigkey};
+					$sig_args->{$sigkey} = 1;
+					if( exists $poe_registration->{INIT_NEW} and $poe_registration->{INIT_NEW}) {
+						my $meth = $poe_registration->{INIT_NEW};
+						$_[KERNEL]->yield( $meth, $sig_args );
+					} else {
+						$sig_args->{SESSION} = undef;
+						$_[KERNEL]->post( 'WxPoeIO', 'REGISTER_SESSION', $sig_args);
+					}
+				}
+
+			},
+			start_another_frame => sub {
+				my $f = $app->newBetterFrame();
+				$_[KERNEL]->yield('init_another_frame',$f);
+			},
+			init_another_frame => sub {
+				my ($f) = @_[ ARG0 ];
+				my $fid = $f->frameIdent();
+				$f->signalQueuePtr($signal_queue);
+				$f->init_wxframe($_wfmgr);
+				if( !defined $_wfmgr) {
+					my $frame_reg = $f->get_frame_registrations();
+					if(defined $frame_reg) {
+						foreach my $sigkey (keys %$frame_reg) {
+							my $sig_args = $frame_reg->{$sigkey};
+							$sig_args->{$sigkey} = 1;
+							$sig_args->{WXFRAME_OBJ} = $_;
+							$_[KERNEL]->post( 'WxPoeIO', 'REGISTER_FRAME', $sig_args);
+						}
+					}
+				} else {
+					my $frame_reg = $_wfmgr->get_new_frame_registrations();
+					if(defined $frame_reg) {
+						foreach my $sigkey (keys %$frame_reg) {
+							my $sig_args = $frame_reg->{$sigkey};
+							$sig_args->{$sigkey} = 1;
+							$sig_args->{WXFRAME_MGR_TOGGLE} = 1;
+							$_[KERNEL]->post( 'WxPoeIO', 'REGISTER_FRAME', $sig_args);
+						}
+					}
+				}
+			},
+			pulse => sub {
+				if ( @AppControl::frames ) {
+					foreach ( @AppControl::frames ) {
+						# show a POE event in wxFrame
+						$_->PoeEvent('pulse');
+					}
+				}
+
+				# Manage signals!
+				$_[KERNEL]->post( 'WxPoeIO', 'TRIGGER_SIGNALS');
+
+				# iterate pulse in ??[3] sec intervals
+				$_[KERNEL]->delay( pulse => 3);
+			},
+
+			SendNotice => \&send_notice_localhost,
+			PhoneHome => \&phone_app,
+			LogMe => \&log_to_yaml,
+			_init_local_call => \&_init_local_call,
+			_init_local_listener => \&_init_local_listener,
+
+
+		},
+	);
+
+	sub send_notice_localhost {
+		# Get the arguments
+		my ($sigkey,$sigvalue) = @_[ ARG0, ARG1 ];
+	}
+	sub phone_app {
+		# Get the arguments
+		my ($sigkey,$sigvalue) = @_[ ARG0, ARG1 ];
+	}
+	sub log_to_yaml {
+		# Get the arguments
+		my ($sigkey,$sigvalue) = @_[ ARG0, ARG1 ];
+	}
+	sub _init_local_call {
+		# Get the arguments
+		my( $meth, $sig_args ) = @_[ ARG0, ARG1 ];
+		$_[KERNEL]->yield( $meth, $sig_args );
+		$sig_args->{SESSION} = undef;
+		$_[KERNEL]->post( 'WxPoeIO', 'REGISTER_SESSION', $sig_args);
+	}
+	sub _init_local_listener {
+		# Get the arguments
+		my( $meth, $sig_args ) = @_[ ARG0, ARG1 ];
+		$_[KERNEL]->yield( $meth, $sig_args );
+		$sig_args->{SESSION} = undef;
+		$_[KERNEL]->post( 'WxPoeIO', 'REGISTER_SESSION', $sig_args);
+	}
+
+=head1 ABSTRACT
+
+	Very simple IO signaling system for POE and Wx Loops.
+
+=head1 DESCRIPTION
+
+This module is very similiar to the POE::Component::SimpleLog logging system. It uses the same type of 
+register/unregister structure. It was partially inspired by the POE: Cookbook - Broadcasting Events and a long bloody fight
+of trying to make Wx events talk with POE sessions.
+
+This module does not do generate or react to signal calls, it simply routes them
+to the designated place ( Evt methods ). The normal routing is between a Poe session and a Wx window. However,
+it is also possible to send signals between two Wx windows.
+
+You have to configure and register a signal that you desire to use. The configuration describes the signal behavior and
+channel you want. The default channel is 'MAIN', so no channel declaration is require if using non-conflicting signals.
+For routing between Wx window, a special channel 'FRAME_TO_FRAME' is used to indicate that the signal is passed 
+directly to another Wx window. The signal must be coordinated on both sides, Poe and Wx, so each side must register.
+
+Registering for a signal sets up a 'watcher' state so that a signal is broadcast to each registered watcher. A signal
+can have multiple dispatches, but only one source. Once the signal task has been completed, the task(er) sends a call
+to 'end_signal' to clear the signal state and to dispatch any completion notices. The completion notices are registered
+normally as a registered [receiving] WxFrame. No special channel is set for Poe to Poe signaling, though that should 
+be an easy add, if needed.
+
+This signaling method only transfers a signal [key] with a single piece of signal data. The intent is not to pass data
+arrays back and forth. If you need to pass data and state around, then I would use some type of data and state manager
+to handle this task. I use shared pointers to state and data objects within my production app.
+
+Note that signals are triggered between Poe and Wx sessions by way of a 'pulse' method per Ed Heil's wxpoe.pl sample code.
+Ed's sample code has been modified in the example to integrate the WxPoeIO signal methods. The code changes were cut from
+production code so the examples may need minor tweaks to run without warnings.
+
+
+The standard way to use this module is to do this:
+
+	use POE;
+	use POE::Component::WxPoeIO;
+
+	####
+	## Declare vars
+	####
+	my $MyApp_name = 'WxPoeTestApp';
+	my $signal_keys = {'signal1'=>1,'signal2'=>2);
+	my $signal_queue = [];
+	
+	POE::Component::WxPoeIO->new( ... );
+
+	my $MyApp = $MyApp_name->new();
+	POE::Session->create( ... );
+
+	POE::Kernel->loop_run();
+	POE::Kernel->run();
+
+=head2 Starting WxPoeIO
+
+To start WxPoeIO, just call it's 'new' method:
+
+	POE::Component::WxPoeIO->new(
+		'ALIAS'			=>	'WxPoeIO',
+		'SIGNAL_KEYS'	=>	$signal_keys,
+		'SIGNAL_QUEUE'	=>	$signal_queue,
+	);
+
+This method will die on error or return success.
+
+This constructor accepts only 3 options.
+
+=over 4
+
+=item C<ALIAS>
+
+This will set the alias WxPoeIO uses in the POE Kernel.
+This will default TO "WxPoeIO"
+
+=item C<SIGNAL_KEYS>
+
+This is a hash pointer to a list of signal keys to be configured and registered later.
+
+=item C<SIGNAL_QUEUE>
+
+This is an array pointer to the signal queue that is shared between the Wx windows and the main Poe session.
+
+=back
+
+=head2 Evt_method
+
+This is the subroutine/method declaration that WxPoeIO uses to dispatch signals. It must match an existing 
+method within the object or session.
+
+=over 4
+
+=item C<CONFIG_SIGNAL>
+
+	This task accepts 6 arguments:
+
+	SIGNAL_KEY	->	The name/key of the signal to register
+	SIGNAL_CHANNEL	->	The channel the signal will use. Provides locking of channel to avoid signal conflicts
+	LATCH		->	The signal can be latch until completion to prevent multiple signal sends
+	TIMEOUT		->	The timeout in secs until a latch is removed - in case the signal dies in a session
+	LOCK		->	The channel can be lock until completion to prevent signal conflicts on the same channel
+	RETRIES		->	The number of times the signal will retry a lock before dying and clearing the lock
+
+	Note: TIMEOUT and RETRIES are not both allowed to be null. One or the other will clear the latch/lock. If a
+	hang has occurred in a session, this will not be fixed.
+
+	An example:
+
+	$_[KERNEL]->post( 'WxPoeIO', 'CONFIG_SIGNAL',
+		SIGNAL_KEY => 'MySig',
+		SIGNAL_CHANNEL => 'Start_Remote_Session',
+		[LATCH => 1,]
+		[LOCK => 1,]
+		[TIMEOUT => undef,]
+		[RETRIES => 100,]
+	);
+
+	The latching and lock is not super complex. The latch prevents new signals with the same key from being
+	accepted. The lock allows similar signals to share the same channel (i.e., session method) but keeps new
+	signals from stepping on a working session. The lock checks for is_noisy channel (an active session on the
+	channel). If is_noisy, then if the channel is not yet locked, it will be locked. Retries kills the signal 
+	by clearing all signal states. This does not fix problems within the session that caused signal not to 
+	terminate.
+  
+	A signal must be configure before a session or a frame can register to use that signal. This is an extra
+	step, but ensures the Poe sessions and Wx frames are registering for the same thing.
+
+=item C<REGISTER_SESSION>
+
+	This task accepts 3 arguments:
+
+	SIGNAL_KEY	->	The name/key of the signal to register
+	SESSION		->	The session where the signal will go ( Also accepts Session ID's )
+	EVT_METHOD	->	The method within the session that will be called upon the signal event
+
+	The registering for a signal will fail if one of the above values are undefined.
+
+	The signal must be pre-configured. Registration links the POE session side of the communication.
+
+	Evt_methods that receive the signals will get these:
+		ARG0 -> SIGNAL_KEY
+		ARG1 -> SIGNAL_VALUE
+
+	Here's an example:
+
+	$_[KERNEL]->post( 'WxPoeIO', 'REGISTER_SESSION',
+		SIGNAL_KEY => 'ClickMe',
+		SESSION => $_[SESSION],
+		EVT_METHOD => 'start_this',
+	);
+
+	This is the session subroutine that will get the ClickMe signal
+	sub start_this {
+		# Get the arguments
+		my( $sigkey, $sigvalue ) = @_[ ARG0 .. ARG1 ];
+
+		print STDERR "Signal [$sigkey] want to start this -> [$sigvalue]\n";
+
+	}
+
+=item C<REGISTER_WXFRAME>
+
+	This task accepts 3 to 5 arguments:
+
+	SIGNAL_KEY		->  The name/key of the signal to register
+	EVT_METHOD		->  The method within the wxframe that will be called upon the signal event
+	[WXFRAME_IDENT]		->  The identification of the wxframe where the 'end signal' will go
+	[WXFRAME_MGR_TOGGLE]	->  A toggle to use a wxframe manager to manage method calls
+	[WXFRAME_OBJ]		->  The stored pointer to the wxframe object
+
+	The registering for a signal will fail if the SIGNAL_KEY or EVT_METHOD values are undefined.
+
+	The signal must be pre-configured. Registration links the WxFrame side of the communication.
+
+	Evt_methods that receive the logs will get these:
+		ARG0 -> SIGNAL_KEY
+		ARG1 -> SIGNAL_VALUE
+
+	An example:
+
+	$_[KERNEL]->post( 'WxPoeIO', 'REGISTER_WXFRAME',
+		SIGNAL_KEY => 'ClickMe',
+		WXFRAME_IDENT => 'Frame 1',
+		EVT_METHOD => 'ShowMyClick',
+		WXFRAME_MGR_TOGGLE => undef,
+	);
+
+	This is the wxframe subroutine that will get the ClickMe signal
+	sub ShowMyClick {
+		# using the passed in argument array and indexes
+		if($_[1]=~/^clickme/i) {
+			$_[0]->{text_show}->AppendText($_[2]."\n");
+		}
+		return;
+	}
+
+=item C<TRIGGER_SIGNALS>
+
+	This task uses no arguments:
+
+	This method pulls new signals from the signal queue (shifting the heap array pointer) and sends the 
+	signal (and signal value) to the manage_to_poe method. When the queue is empty, the task exits.
+
+	An example:
+
+	$_[KERNEL]->post( 'WxPoeIO', 'TRIGGER_SIGNALS' );
+
+=item C<END_SIGNAL>
+
+	This task accepts 2 arguments:
+
+	ARG0	->	signal key
+	ARG1	->	end value
+
+	This method normally completes the signaling task. If the sigal requires no latch or locking then it is not 
+	necessary to end the signal. But typically it is appropriate to send back a completion status or to remove 
+	locks on the signal channel. Inter wx frame communication will not use an end_signal. This should not be 
+	necessary because the signal result should be visually presented to the user.
+
+	An example:
+
+	$_[KERNEL]->post( 'WxPoeIO', 'END_SIGNAL', $sigkey, $endsigvalue );
+
+	Where, $sigkey is the relevant SIGNAL_KEY value. And $endsigvalue is the variable sent back to wxframe.
+
+	NOTE: The type of the $sigvalue is not restricted and there is no checking of this value. As long as both sides
+	of the communication can process this variable, you will be fine. This value (variable) is not intended for 
+	the passing of large data structures. If you have this need, then you should create a data management object to 
+	be shared across wxframes and sessions.
+
+=item C<EXPORT_SIG_QUEUE_PTR>
+
+	The pointer for the signal queue array should be passed in when the module is started. However, a 'default' 
+	pointer can be exported (and stored) so that signalkeys are properly pushed onto the HEAP signal queue array.
+
+	An example:
+
+	if( !defined $signal_queue_ptr ) {
+	
+		$_[KERNEL]->post( 'WxPoeIO', 'EXPORT_SIQ_QUEUE_PTR', $signal_queue_ptr );
+
+	}
+	
+	The $signal_queue_ptr variable will now match the signal queue array pointer within the POE $_[HEAP];
+
+=item C<SHUTDOWN>
+
+	This is the generic SHUTDOWN routine, it will stop all logging.
+
+	An example:
+
+	$_[KERNEL]->post( 'WxPoeIO', 'SHUTDOWN' );
+
+=back
+
+=head2 WxPoeIO Notes
+
+Case matters. All of the options are uppercase.
+
+You can enable debugging mode by doing this:
+
+	sub POE::Component::WxPoeIO::DEBUG () { 1 }
+	use POE::Component::WxPoeIO;
+
+=head2 EXPORT
+
+Nothing.
+
+=head1 SEE ALSO
+
+L<POE>
+
+=head1 AUTHOR
+
+Apocalypse E<lt>apocal@cpan.orgE<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright 2014 by Sebastian
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself.
+
+Source credit goes to the POE: Cookbook - Broadcasting Events for the signal channel registry concept. The code structure comes from 
+the POE::Component::SimpleLog by Apocalypse. The WxPoe and pulse concept is from the wxpoe2.pl example code by Ed Heil.
+
+
+=cut
