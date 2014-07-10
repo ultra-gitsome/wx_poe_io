@@ -42,6 +42,8 @@ has 'SIGNAL_LOOP_DETAILS_CARP' => (isa => 'Int', is => 'rw', default => 1 );
 has 'SIGNAL_LATCH_CARP' => (isa => 'Int', is => 'rw', default => 0 );
 has 'SIGNAL_LOCK_CARP' => (isa => 'Int', is => 'rw', default => 0 );
 has 'CLEAR_SIGNAL_CARP' => (isa => 'Int', is => 'rw', default => 0 );
+has 'UPDATING_CARP' => (isa => 'Int', is => 'rw', default => 1 );
+has 'TOWX_CARP' => (isa => 'Int', is => 'rw', default => 0 );
 has 'ALIAS' => (isa => 'Str', is => 'rw', builder => '__set_alias' );
 has 'MAIN_WXSERVER_ALIAS' => (isa => 'Str', is => 'ro');
 has 'LOCK_TIMEOUT_DEFAULT' => (isa => 'Int', is => 'ro', default => 5 );
@@ -260,16 +262,22 @@ sub session_create {
 				'_WAIT_POE_LOCK'	=>	"_wait_poe_lock",
 
 				# Terminate signal and clean up state
-				'END_SIGNAL'		=>	"end_signal",
+				'END_SIGNAL'		=>	"_end_signal",
 
 				# Fire a single signal
 				'_CLEAR_SIGNAL'		=>	'_clear_signal',
 
+				# Fire a single signal
+				'_KILL_SIGNAL'		=>	'_kill_signal',
+
 				# Set results of signal completion
-				'SET_RESULTS_AND_END'		=>	"set_results_and_end",
+				'SET_RESULTS_AND_END'		=>	"_set_results_and_end",
+
+				# Send and update to WxFrame of new state
+				'UPDATE_SIGNAL'		=>	'_update_signal',
 
 				# SIGNAL SOMETHING to WxFrame!
-				'TO_WX'			=>	"toWx",
+				'TO_WX'			=>	"_toWx",
 
 				# export method to obtain the pointer to the signal queue
 				'EXPORT_SIG_QUEUE_PTR' => "export_queue_ptr",
@@ -326,18 +334,24 @@ sub Config_signal {
 	if ( exists $args->{LOCK} and $args->{LOCK} ) {
 		$loc_args{LOCK} = 1;
 	}
-	if ( exists $args->{LOCK_TIMEOUT} and $args->{LOCK_TIMEOUT} ) {
+	## LOCK_TIMEOUT times out the lock as set
+	if ( exists $args->{LOCK_TIMEOUT}) { # and $args->{LOCK_TIMEOUT} ) {
 		$loc_args{LOCK_TIMEOUT} = $args->{LOCK_TIMEOUT};
 	}
+	## LOCK_RETRY_TIME counts off the number of times the lock is checked before dying
 	if ( exists $args->{LOCK_RETRY_TIME} ) {
-		$loc_args{LOCK_RETRY_TIME} = $args->{LOCK_RETRY_TIME};
-		# Force falsy state to be an integer 0
-		if(!$loc_args{LOCK_RETRY_TIME}) {
+		if ( $args->{LOCK_RETRY_TIME} ) {
+			$loc_args{LOCK_RETRY_TIME} = $args->{LOCK_RETRY_TIME};
+		} elsif( defined $args->{LOCK_RETRY_TIME} and $args->{LOCK_RETRY_TIME} == 0 ) {
+			# Force falsy state to be an integer 0
 			$loc_args{LOCK_RETRY_TIME} = 0;
 		}
 	}
 	if ( exists $args->{SIGNAL_IS_INACTIVE} and $args->{SIGNAL_IS_INACTIVE} ) {
 		$loc_args{SIGNAL_IS_INACTIVE} = 1;
+	}
+	if ( exists $args->{SIGNAL_KILL_SIGVALUE} and defined $args->{SIGNAL_KILL_SIGVALUE} ) {
+		$loc_args{SIGNAL_KILL_SIGVALUE} = $args->{SIGNAL_KILL_SIGVALUE};
 	}
 
 	if ( !exists $_[OBJECT]->{SIGNAL_KEYS}->{ $args->{SIGNAL_KEY} } ) {
@@ -357,6 +371,14 @@ sub Config_signal {
 		$_[OBJECT]->{SIGNAL_KEY_HREF}->{ $args->{SIGNAL_KEY} }->{IS_BLOCKED} = 1;
 		print "[CONFIG WXPOEIO] sigkey[".$args->{SIGNAL_KEY}."] is set INACTIVE...use is blocked for signal [".$args->{SIGNAL_KEY}."] blocked[".$_[OBJECT]->{SIGNAL_KEY_HREF}->{ $args->{SIGNAL_KEY} }->{IS_BLOCKED}."]\n" if $_[OBJECT]->{STARTUP_CARP};
 	}
+	if ( exists $args->{SIGNAL_KILL_SIGVALUE} ) {
+		## check for an indefinite lock [0] on LOCK_RETRY_TIME
+		if(!$loc_args{LOCK_RETRY_TIME}) {
+			$_[OBJECT]->{SIGNAL_KEY_HREF}->{ $args->{SIGNAL_KEY} }->{SIGNAL_KILL_SIGVALUE} = $loc_args{SIGNAL_KILL_SIGVALUE};
+			print "[CONFIG WXPOEIO] signal kill sigvalue for sigkey[".$args->{SIGNAL_KEY}."] is set to [".$_[OBJECT]->{SIGNAL_KEY_HREF}->{ $args->{SIGNAL_KEY} }->{SIGNAL_KILL_SIGVALUE}."] \n" if $_[OBJECT]->{STARTUP_CARP};
+		}
+	}
+	print "[CONFIG WXPOEIO] lock timeout for sigkey[".$args->{SIGNAL_KEY}."] is set to [".$_[OBJECT]->{SIGNAL_KEY_HREF}->{ $args->{SIGNAL_KEY} }->{LOCK_TIMEOUT}."] \n" if $_[OBJECT]->{STARTUP_CARP};
 	if ( exists $args->{SENDBACK_NOTICE_NO_REGISTRATION} and $args->{SENDBACK_NOTICE_NO_REGISTRATION} ) {
 		$_[OBJECT]->{SIGNAL_KEY_HREF}->{ $args->{SIGNAL_KEY} }->{SENDBACK_NOTICE_NO_REGISTRATION} = 1;
 	}
@@ -382,7 +404,7 @@ sub Register_session {
 	if( exists $args->{CARP_REG} ) {
 		$carp = $args->{CARP_REG};
 	}
-	print "[REGISTER WXPOE SESS] registering session [".$args->{SIGNAL_KEY}."]\n" if $carp;
+	print "[REGISTER WXPOE SESS] registering session[".$args->{SESSION}."] for sigkey[".$args->{SIGNAL_KEY}."]\n" if $carp;
 
 	# Validation - silently ignore errors
 	if ( ! defined $args->{SIGNAL_KEY} ) {
@@ -440,6 +462,7 @@ sub Register_session {
 		}
 	} else {
 		$_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{EVT_METHOD_POE} =  $args->{EVT_METHOD_POE};
+		print "[REGISTER WXPOE SESS] [".$args->{SIGNAL_KEY}."] registering Poe Method [".$args->{EVT_METHOD_POE}."] under SESSION key [".$args->{SESSION}."]\n" if $carp;
 	}
 
 	if(exists $args->{EVT_METHOD_LOG} and $args->{EVT_METHOD_LOG}=~/^__([\w_\-]+)__$/) {
@@ -469,17 +492,19 @@ sub Register_session {
 	}
 	
 	# Also check for a FRAME event method in the signal key hash
-	if ( ! exists $args->{EVT_METHOD_WXFRAME} or ! $args->{EVT_METHOD_WXFRAME}) {
-		if ( exists $_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{EVT_METHOD_WXFRAME} ) {
+#	if ( ! exists $args->{EVT_METHOD_WXFRAME} or ! $args->{EVT_METHOD_WXFRAME}) {
+	if (exists $args->{EVT_UPDATE_WXFRAME} and $args->{EVT_UPDATE_WXFRAME}) {
+		if ( exists $_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{EVT_UPDATE_WXFRAME} ) {
 			# Duplicate record...
 			if ( $_[OBJECT]->{SIGNAL_DUPLICATE_CARP} ) {
 				#warn "Tried to register a duplicate! -> LogName: ".$args->{SIGNAL_KEY}." -> Target Session: ".$args->{SESSION}." -> Event: ".$args->{EVT_METHOD_WXFRAME};
-				warn "[WXPOEIO REGISTER] Duplicate signal -> sigkey[".$args->{SIGNAL_KEY}."] Session[".$args->{SESSION}."] Event[".$args->{EVT_METHOD_WXFRAME}."] ... ignoring  ";
+				warn "[WXPOEIO REGISTER] Duplicate signal -> sigkey[".$args->{SIGNAL_KEY}."] Session[".$args->{SESSION}."] Event[".$args->{EVT_UPDATE_WXFRAME}."] ... ignoring  ";
 				return undef;
 			}
 		} else {
-			$_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{EVT_METHOD_WXFRAME} =  $args->{EVT_METHOD_WXFRAME};
-			print "[REGISTER WXFRAME SESS] this method [".$args->{EVT_METHOD_WXFRAME}."] for signal[".$args->{SIGNAL_KEY}."]\n" if $carp;
+			$_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{EVT_UPDATE_WXFRAME} =  $args->{EVT_UPDATE_WXFRAME};
+		#	print "[REGISTER WXPOE SESS] register UPDATE method [".$args->{EVT_UPDATE_WXFRAME}."] for signal[".$args->{SIGNAL_KEY}."]\n" if $carp;
+			print "[REGISTER WXPOE SESS] [".$args->{SIGNAL_KEY}."] registering UPDATE Method [".$args->{EVT_UPDATE_WXFRAME}."] under SESSION key [".$args->{SESSION}."]\n" if $carp;
 		}
 	}
 
@@ -598,12 +623,23 @@ sub Register_frame {
 	if ( ! exists $_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} } ) {
 		$_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} } = {};
 	}
+	print "[WXPOEIO - REG F] frame [$frame] registered for SignalKey: [".$args->{SIGNAL_KEY}."]\n";
 
 	# Finally store the wx method in the signal key method hash
 	if ( ! exists $_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} }->{WX_METHODS} ) {
 		$_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} }->{WX_METHODS} = {};
 	}
 	$_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} }->{WX_METHODS}->{ $args->{EVT_METHOD_WXFRAME} } = 1;
+	print "[WXPOEIO - REG F] evt methods, evt[".$args->{EVT_METHOD_WXFRAME}."]";
+
+	# Finally store the wx method in the signal key method hash
+	if( exists $args->{EVT_UPDATE_WXFRAME} and $args->{EVT_UPDATE_WXFRAME}) {
+		if ( ! exists $_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} }->{WX_UPDATE} ) {
+			$_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} }->{WX_UPDATE} = {};
+		}
+		$_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} }->{WX_UPDATE}->{ $args->{EVT_UPDATE_WXFRAME} } = 1;
+		print ", evt_up[".$args->{EVT_UPDATE_WXFRAME}."]";
+	}
 
 	# set USE_WXFRAME_MGR to falsy as default
 	$_[OBJECT]->{WXFRAMEIO}->{$frame}->{USE_WXFRAME_MGR} = 0; 
@@ -612,8 +648,8 @@ sub Register_frame {
 	} else {
 		$_[OBJECT]->{WXFRAMEIO_WXSIGHANDLE}->{$frame}->{WXFRAME_OBJ} = $args->{WXFRAME_OBJ};
 	}
+	print " registered for SignalKey: [".$args->{SIGNAL_KEY}."]\n";
 
-	print "frame [$frame] registered for SignalKey: [".$args->{SIGNAL_KEY}."]\n";
 	# All registered!
 	return 1;
 }
@@ -946,14 +982,14 @@ sub _manage_to_poe {
 }
 
 # Where the work results are set...
-sub set_results_and_end {
+sub _set_results_and_end {
 	# ARG0 = signal_key, ARG1 = signal_value, [Optional, ARG2 = _wxframe_manager]
 	my( $sigkey, $sigvalue, $res_href ) = @_[ ARG0, ARG1, ARG2 ];
 
 	my $key = $sigkey . "_" . $sigvalue; ## avoiding potential '0' keys
 	$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS} = 0;
 	$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = '';
-	$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{DMETHOD} = '_default_';
+	$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{LAYOUT_OBJ_METHOD} = '_default_';
 	if($res_href=~/HASH/i) {
 		if(exists $res_href->{status}) {
 			$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS} = $res_href->{status};
@@ -963,9 +999,9 @@ sub set_results_and_end {
 			$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = $res_href->{message};
 			delete $res_href->{message};
 		}
-		if(exists $res_href->{dmethod}) {
-			$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{DMETHOD} = $res_href->{dmethod};
-			delete $res_href->{dmethod};
+		if(exists $res_href->{layout_obj_method}) {
+			$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{LAYOUT_OBJ_METHOD} = $res_href->{layout_obj_method};
+			delete $res_href->{layout_obj_method};
 		}
 	}
 	undef $res_href;
@@ -976,7 +1012,7 @@ sub set_results_and_end {
 }
 
 # Where the work is finished...
-sub end_signal {
+sub _end_signal {
 	# ARG0 = signal_key, ARG1 = signal_value, [Optional, ARG2 = _wxframe_manager]
 	my( $sigkey, $sigvalue ) = @_[ ARG0, ARG1 ];
 	print "[WXPOEIO] end of signal - send response [".$sigkey."] clear signal\n";
@@ -1016,26 +1052,101 @@ sub end_signal {
 	return 1;
 }
 
-# Where EVEN MORE work is done...
-sub toWx {
+# Where the work is finished...
+sub _update_signal {
 	# ARG0 = signal_key, ARG1 = signal_value, [Optional, ARG2 = _wxframe_manager]
-	my( $sigkey, $sigvalue ) = @_[ ARG0, ARG1 ];
-	print " send to WX - send response [".$sigkey."]\n";
+	my( $sigkey, $sigvalue, $res_href ) = @_[ ARG0, ARG1, ARG2 ];
+	
+	my $update = 1;
+	print "[WXPOEIO UPDATE SIGNAL] update - send notice [".$sigkey."] update signal[$update]\n" if $_[OBJECT]->{UPDATING_CARP};
+
+	# Search for this signal!
+	if ( exists $_[OBJECT]->{WXPOEIO}->{ $sigkey } ) {
+
+		my $key = $sigkey . "_" . $sigvalue; ## avoiding potential '0' keys
+		$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS} = 0;
+		$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = '';
+#		$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{LAYOUT_OBJ_METHOD} = '_default_';
+		if($res_href=~/HASH/i) {
+			if(exists $res_href->{status}) {
+				$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS} = $res_href->{status};
+				delete $res_href->{status};
+			}
+			if(exists $res_href->{message}) {
+				$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = $res_href->{message};
+#print "[update signal] message [".$res_href->{message}."]\n";
+				delete $res_href->{message};
+			}
+#			if(exists $res_href->{layout_obj_method}) {
+#				$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{LAYOUT_OBJ_METHOD} = $res_href->{layout_obj_method};
+#				delete $res_href->{layout_obj_method};
+#			}
+		}
+		undef $res_href;
+
+	} else {
+		if ( $_[OBJECT]->{SIGNAL_LOOP_CARP} ) {
+			warn "Terminating an unregistered signal. Opps! [$sigkey]";
+		}
+	}
+	
+#
+#	if ( exists $_[OBJECT]->{WXPOEIO_LOG}->{ $sigkey } ) {
+#		print "send signal to logger! [".$sigkey."]\n";
+#		$_[KERNEL]->yield('_TO_LOGGER', $sigkey, $sigvalue);
+#	}
+
+	# signal sent to wxframe, close loop
+	print "[WXPOEIO UPDATE] send update[$update] notice to_wx [".$sigkey."]\n" if $_[OBJECT]->{UPDATING_CARP};
+	$_[KERNEL]->yield('TO_WX', $sigkey, $sigvalue, $update);
+	return 1;
+}
+
+# Where EVEN MORE work is done...
+sub _toWx {
+	# ARG0 = signal_key, ARG1 = signal_value, [Optional, ARG2 = _wxframe_manager]
+	my( $self, $sigkey, $sigvalue, $update ) = @_[ OBJECT, ARG0, ARG1, ARG2 ];
+	if($self->{TOWX_CARP}) {
+		print " send to WX - send response [".$sigkey."]";
+		print " update[$update]" if defined $update;
+		print "\n";
+	}
 
 	# Search through the registrations for this specific one
 	foreach my $wxframe ( keys %{ $_[OBJECT]->{WXFRAMEIO} } ) {
 		# Scan frame key for signal key
-		print "[toWx] scan frame [$wxframe] for sigkey[$sigkey]\n";
+		print "[toWx] scan frame [$wxframe] for sigkey[$sigkey]\n" if $self->{TOWX_CARP};
 		if ( exists $_[OBJECT]->{WXFRAMEIO}->{$wxframe}->{$sigkey} ) {
 			# Scan for the proper evt_method!
+			## first check for if this is an update notice
+			if($update) {
+				foreach my $evt_up ( keys %{ $_[OBJECT]->{WXFRAMEIO}->{$wxframe}->{$sigkey}->{WX_UPDATE} } ) {
+					print "[toWx] found update method[$evt_up] for frame [$wxframe] for sigkey[$sigkey]\n" if $self->{TOWX_CARP};
+					my $key = $sigkey . "_" . $sigvalue; ## avoiding potential '0' keys
+					my $status = 0;
+					my $message = 'null';
+					my $layout_data_method = '_none_';
+					if( exists $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS}) {
+						$status = $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS};
+						$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS} = 0;
+					}
+					if( exists $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE}) {
+						$message = $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE};
+						$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = '';
+					}
+					if(defined $_[OBJECT]->{WXFRAME_MGR}) {
+						my $wxframe_obj = $_[OBJECT]->{WXFRAME_MGR}->frame_handle_by_key($wxframe);
+						print "[toWx] using wfmgr for sending UPDATE to wxframe[$wxframe_obj] method[$evt_up] for sigkey[$sigkey] sigvalue[$sigvalue]\n" if $self->{TOWX_CARP};
+						$wxframe_obj->$evt_up( $sigkey, $sigvalue, $status, $message, );
+					}
+					## else, fail silently...nothing is return to the wxframe
+				}
+				return 1;
+			}
 			foreach my $evt_meth ( keys %{ $_[OBJECT]->{WXFRAMEIO}->{$wxframe}->{$sigkey}->{WX_METHODS} } ) {
 
-			print "[toWx] found method[$evt_meth] for frame [$wxframe] for sigkey[$sigkey]\n";
+				print "[toWx] found method[$evt_meth] for frame [$wxframe] for sigkey[$sigkey]\n" if $self->{TOWX_CARP};
 
-#				if ( exists $_[OBJECT]->{WXFRAMEIO_WXSIGHANDLE}->{$wxframe}->{USE_WXFRAME_MGR} ) {
-#					$_wfmgr->$evt_meth( $sigkey,$sigvalue );
-#					return 1;
-#				}
 				my $key = $sigkey . "_" . $sigvalue; ## avoiding potential '0' keys
 				my $status = 0;
 				my $message = 'null';
@@ -1043,30 +1154,27 @@ sub toWx {
 				if( exists $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS}) {
 					$status = $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS};
 					$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS} = 0;
-					#delete $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS};
 				}
 				if( exists $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE}) {
 					$message = $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE};
 					$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = '';
-					#delete $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE};
 				}
-#				if(exists $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{DMETHOD}) {
-#					$data_method = $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{DMETHOD};
-#					$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{DMETHOD} = '_default_';
-#					#delete $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{DMETHOD};
-#				}
 				if(defined $_[OBJECT]->{WXFRAME_MGR}) {
 					my $wxframe_obj = $_[OBJECT]->{WXFRAME_MGR}->frame_handle_by_key($wxframe);
-#					my $wxframe_mgr = $_[OBJECT]->{WXFRAME_MGR};
-#					$wxframe_obj->$evt_meth( wxframe => $wxframe_obj, sigkey => $$sigkey, sigvalue => $sigvalue, status => $status, message => $message, method = '' );
-			print "[toWx] using wfmgr for sending to wxframe[$wxframe_obj] method[$evt_meth] for sigkey[$sigkey] sigvalue[$sigvalue]\n";
-		#			$wxframe_mgr->$evt_meth( wxframe => $wxframe_obj, sigkey => $$sigkey, sigvalue => $sigvalue, status => $status, message => $message );
-					$wxframe_obj->$evt_meth( $sigkey, $sigvalue, $status, $message, );
+					if( my $ref = eval { $wxframe_obj->can($evt_meth) } ) {
+						$wxframe_obj->$evt_meth( $sigkey, $sigvalue, $status, $message, );
+						print ".........method found[".$evt_meth."][$ref] in [$wxframe_obj]\n" if $self->{TOWX_CARP};
+					} else {
+						print ".........method NOT found[".$evt_meth."] in [$wxframe_obj]\n" if $self->{TOWX_CARP};
+						next;
+					}
+					print "[toWx] using wfmgr for sending to wxframe[$wxframe_obj] method[$evt_meth] for sigkey[$sigkey] sigvalue[$sigvalue]\n" if $self->{TOWX_CARP};
+					#my $wxframe_mgr = $_[OBJECT]->{WXFRAME_MGR};
+					#$wxframe_mgr->$evt_meth( wxframe => $wxframe_obj, sigkey => $$sigkey, sigvalue => $sigvalue, status => $status, message => $message );
 				} elsif ( exists $_[OBJECT]->{WXFRAMEIO_WXSIGHANDLE}->{$wxframe}->{WXFRAME_OBJ} ) {
 					my $wxframe_obj = $_[OBJECT]->{WXFRAMEIO_WXSIGHANDLE}->{$wxframe}->{WXFRAME_OBJ};
 					$wxframe_obj->$evt_meth( $sigkey, $sigvalue, $status, $message, );
 				}
-				## else, fail silently...nothing is return to the wxframe
 			}
 		}
 	}
@@ -1084,22 +1192,22 @@ sub _manage_latching {
 
 	my $states = $_[OBJECT]->{WXPOEIO_WAIT_SIGNAL_LATCH};
 	my $count = 0;
-	print "{WXPOEIO - MANAGE LATCH] manage the latch in-sigkey[$sigkey] ct[".$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LATCH_ATTEMPTS}."]\n" if $_[OBJECT]->{SIGNAL_LOOP_DETAILS_CARP};
+	print "{WXPOEIO - MANAGE LATCH] manage the latch in-sigkey[$sigkey] ct[".$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LATCH_ATTEMPTS}."]\n" if $_[OBJECT]->{SIGNAL_LATCH_CARP};
 	foreach my $sigkey (keys %$states) {
-		print " =[WXPOEIO - WAIT LATCH] for sigkey[$sigkey] state[".$states->{$sigkey}."] count[".$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LATCH_ATTEMPTS}."]\n" if $_[OBJECT]->{SIGNAL_LOOP_DETAILS_CARP};
+		print " =[WXPOEIO - WAIT LATCH] for sigkey[$sigkey] state[".$states->{$sigkey}."] count[".$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LATCH_ATTEMPTS}."]\n" if $_[OBJECT]->{SIGNAL_LATCH_CARP};
 		if($states->{$sigkey}) {
 			$count++;
 			if(!$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{IS_LATCHED}) {
 				$count--;
 				$states->{$sigkey} = 0;
-				print " == [WXPOEIO - WAIT LATCH] latch *done* for sigkey[$sigkey] state[".$states->{$sigkey}."] count[".$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LATCH_ATTEMPTS}."]\n" if $_[OBJECT]->{SIGNAL_LOOP_DETAILS_CARP};
+				print " == [WXPOEIO - WAIT LATCH] latch *done* for sigkey[$sigkey] state[".$states->{$sigkey}."] count[".$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LATCH_ATTEMPTS}."]\n" if $_[OBJECT]->{SIGNAL_LATCH_CARP};
 				$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LATCH_ATTEMPTS} = 0;
 			}
 			$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LATCH_ATTEMPTS} = $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LATCH_ATTEMPTS} + 1;
 			if ( $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LATCH_ATTEMPTS} > $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LATCH_TIMEOUT}) {
 				$count--;
 				$states->{$sigkey} = 0;
-				print " == [WXPOEIO - WAIT LATCH] latch *count-out* for sigkey[$sigkey] state[".$states->{$sigkey}."] count[".$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LATCH_ATTEMPTS}."]\n" if $_[OBJECT]->{SIGNAL_LOOP_DETAILS_CARP};
+				print " == [WXPOEIO - WAIT LATCH] latch *count-out* for sigkey[$sigkey] state[".$states->{$sigkey}."] count[".$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LATCH_ATTEMPTS}."]\n" if $_[OBJECT]->{SIGNAL_LATCH_CARP};
 				$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{IS_LATCHED} = 0;
 				$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LATCH_ATTEMPTS} = 0;
 			}
@@ -1136,16 +1244,20 @@ sub _to_poe {
 			return 1;
 		}
 		# Find out if this session exists
+		print "[TO_POE] TSession[$TSession] not _MAIN..._\n" if $_[OBJECT]->{SIGNAL_LOOP_CARP};
 		if ( ! $_[KERNEL]->ID_id_to_session( $TSession ) ) {
 			# rats...:)
 			if ( $_[OBJECT]->{SIGNAL_LOOP_CARP} ) {
-				warn "TSession ID $TSession does not exist";
+				print "[TO_POE] initial TSession[$TSession] does not have a session ID\n";
+#				warn "TSession ID $TSession does not exist";
 			}
-			print "[TO_POE] TSession[$TSession] does not have a session ID\n";
+			print "[TO_POE] use main session [$TSession] at alias [$PSession] for signal [$sigkey] [".$_[OBJECT]->{MAIN_WXSERVER_ALIAS}."]\n" if $_[OBJECT]->{SIGNAL_LOOP_CARP};
 			if(defined $_[KERNEL]->alias_resolve($TSession)) {
 				my $ts = $_[KERNEL]->alias_resolve($TSession);
 #				warn "TSession ID is [".$ts."]";
 				$PSession = $_[KERNEL]->ID_session_to_id( $ts );
+				print "[TO_POE] using -ALIAS-Resolve- ts-alias[$ts] new PSession[$PSession] for signal [$sigkey]\n" if $_[OBJECT]->{SIGNAL_LOOP_CARP};
+#				print "[TO_POE] using -ALIAS-Resolve- ts-alias[$ts] new PSession[$PSession] meth[$evt_meth] for signal [$sigkey] [".$_[OBJECT]->{MAIN_WXSERVER_ALIAS}."]\n" if $_[OBJECT]->{SIGNAL_LOOP_CARP};
 #				warn "new TSession ID [$PSession] has been found";
 			}
 		} else {
@@ -1180,7 +1292,7 @@ sub _to_logger {
 	if(exists $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS}) {
 		$res_href->{STATUS} = $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS};
 		$res_href->{MESSAGE} = $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE};
-		$res_href->{DMETHOD} = $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{DMETHOD};
+		$res_href->{LAYOUT_OBJ_METHOD} = $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{LAYOUT_OBJ_METHOD};
 	}
 
 	# Now, loop over each possible poe session (poe alias), 
@@ -1253,15 +1365,15 @@ sub _manage_locking {
 	}
 	
 	## check if channel locking is required
-	print "[_MANAGE_LOCKING] using channel [$channel] for signal [$sigkey]\n" if $_[OBJECT]->{SIGNAL_LATCH_CARP};
+	print "[_MANAGE_LOCKING] using channel [$channel] for signal [$sigkey]\n" if $_[OBJECT]->{SIGNAL_LOCK_CARP};
 	if ( exists $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LOCK}  and $_[OBJECT]->{SIGNAL_KEY_HREF}->{ $sigkey }->{LOCK}) {
 		## locking is required, check for lock...and channel noise 
-		print "[_MANAGE_LOCKING] lock required for channel[$channel] signal [$sigkey]\n" if $_[OBJECT]->{SIGNAL_LATCH_CARP};
+		print "[_MANAGE_LOCKING] lock required for channel[$channel] signal [$sigkey]\n" if $_[OBJECT]->{SIGNAL_LOCK_CARP};
 		if ( !exists $_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{IS_LOCKED}  or !$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{IS_LOCKED}) {
 			## channel is unlocked, lock channel and send to POE
-			print "[_MANAGE_LOCKING] NEW lock state for channel[$channel] signal [$sigkey]\n" if $_[OBJECT]->{SIGNAL_LATCH_CARP};
+			print "[_MANAGE_LOCKING] NEW lock state for channel[$channel] signal [$sigkey]\n" if $_[OBJECT]->{SIGNAL_LOCK_CARP};
 			if ( exists $_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{IS_NOISY}  and $_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{IS_NOISY}) {
-				print "[_MANAGE_LOCKING] channel [$channel] is in use, but no conflict" if $_[OBJECT]->{SIGNAL_LATCH_CARP};
+				print "[_MANAGE_LOCKING] channel [$channel] is in use, but no conflict" if $_[OBJECT]->{SIGNAL_LOCK_CARP};
 			} else {
 				$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{IS_NOISY} = 1;
 				$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{NOISE}->{$sigkey} = 1;
@@ -1277,48 +1389,58 @@ sub _manage_locking {
 			if(exists $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LOCK_TIMEOUT}) {
 				$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{WAIT_LOCK_ENDCOUNT} = $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LOCK_TIMEOUT};
 			}
+			print "[_MANAGE_LOCKING] lock end count [".$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{WAIT_LOCK_ENDCOUNT}."] for channel[$channel] signal [$sigkey].\n" if $_[OBJECT]->{SIGNAL_LOCK_CARP};
 			$_[KERNEL]->yield('_TO_POE', $sigkey, $sigvalue);
-			$_[KERNEL]->delay('_WAIT_ON_LOCK_TIMEOUT' => 1, $sigkey, $sigvalue);
+			if($_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{WAIT_LOCK_ENDCOUNT}) {
+				## an endcount of 0 means that the lock does not timeout.
+				$_[KERNEL]->delay('_WAIT_ON_LOCK_TIMEOUT' => 1, $sigkey, $sigvalue);
+			}
 			return 1;
 		}
-		if( exists $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LOCK_RETRY_TIME} and $_[OBJECT]->{SIGNAL_KEY_HREF}->{ $sigkey }->{LOCK_RETRY_TIME} ) {
-			if ( !exists $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{RETRY_ATTEMPTS}) {
-				$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{RETRY_ATTEMPTS} = 0;
-			}
-			$_[OBJECT]->{WXPOEIO_WAIT_SIGNALS_TO_UNLOCK}->{$channel}->{$sigkey} = 1;
-			print "[_MANAGE_LOCKING] lock state [".$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{IS_LOCKED}."] for channel[$channel] signal [$sigkey]...validate signal for reset\n" if $_[OBJECT]->{SIGNAL_LATCH_CARP};
-			if ( !exists $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{WAIT_BLOCKED}  or !$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{WAIT_BLOCKED}) {
-				$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{WAIT_BLOCKED} = 1;
-			}
-			$_[OBJECT]->{WXPOEIO_WAIT_CHANNEL_TO_UNLOCK}->{$sigkey} = 1;
-#			$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{RETRY_ATTEMPTS} = 0;
-#			my $signal = $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{SIGNAL_HOLD_TMP};
-			my $signal = $_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{LOCK_SIGNAL}; # = {$sigkey => $sigvalue};
-			foreach my $sigkey2 (keys %$signal) {
-				my $sigvalue2 = $signal->{$sigkey2};
-				print "[_MANAGE_LOCKING] comparing signal; this signal[$sigkey]:tmp_hold_sig[$sigkey2] sigval[$sigvalue2]\n" if $_[OBJECT]->{SIGNAL_LATCH_CARP};
-				if($sigkey2=~/^$sigkey$/) {
-					if($sigvalue2=~/^$sigvalue$/) {
-						## drop this signal
-						## do not use repeated signals to avoid creating race conditions or secondary errors
-						print "== [_MANAGE_LOCKING] dropping this signal[$sigkey]:[$sigvalue]...cannot reset same signal\n" if $_[OBJECT]->{SIGNAL_LATCH_CARP};
-						$_[KERNEL]->yield('_CLEAR_SIGNAL', $sigkey, $sigvalue);
-						return 0;
+		if( exists $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{LOCK_RETRY_TIME} ) {
+			if( $_[OBJECT]->{SIGNAL_KEY_HREF}->{ $sigkey }->{LOCK_RETRY_TIME} ) {
+				if ( !exists $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{RETRY_ATTEMPTS}) {
+					$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{RETRY_ATTEMPTS} = 0;
+				}
+				$_[OBJECT]->{WXPOEIO_WAIT_SIGNALS_TO_UNLOCK}->{$channel}->{$sigkey} = 1;
+				print "[_MANAGE_LOCKING] lock state [".$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{IS_LOCKED}."] for channel[$channel] signal [$sigkey]...validate signal for reset\n" if $_[OBJECT]->{SIGNAL_LOCK_CARP};
+				if ( !exists $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{WAIT_BLOCKED}  or !$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{WAIT_BLOCKED}) {
+					$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{WAIT_BLOCKED} = 1;
+				}
+				$_[OBJECT]->{WXPOEIO_WAIT_CHANNEL_TO_UNLOCK}->{$sigkey} = 1;
+	#			$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{RETRY_ATTEMPTS} = 0;
+	#			my $signal = $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{SIGNAL_HOLD_TMP};
+				my $signal = $_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{LOCK_SIGNAL}; # = {$sigkey => $sigvalue};
+				foreach my $sigkey2 (keys %$signal) {
+					my $sigvalue2 = $signal->{$sigkey2};
+					print "[_MANAGE_LOCKING] comparing signal; this signal[$sigkey]:tmp_hold_sig[$sigkey2] sigval[$sigvalue2]\n" if $_[OBJECT]->{SIGNAL_LOCK_CARP};
+					if($sigkey2=~/^$sigkey$/) {
+						if($sigvalue2=~/^$sigvalue$/) {
+							## drop this signal
+							## do not use repeated signals to avoid creating race conditions or secondary errors
+							print "== [_MANAGE_LOCKING] dropping this signal[$sigkey]:[$sigvalue]...cannot reset same signal\n" if $_[OBJECT]->{SIGNAL_LOCK_CARP};
+							$_[KERNEL]->yield('_CLEAR_SIGNAL', $sigkey, $sigvalue);
+							return 0;
+						}
 					}
 				}
+				my $signal_reload = {$sigkey => $sigvalue};
+				print "[_MANAGE_LOCKING] reloading this signal[$sigkey] into the siqnal queue\n" if $_[OBJECT]->{SIGNAL_LATCH_CARP};
+	#			my $sq = $_[OBJECT]->{WXPOEIO_QUEUE};
+				my $sq = $_[OBJECT]->{WXPOEIO_QUEUE_TMP_HOLD};
+				push @$sq, $signal_reload;
+				$_[KERNEL]->delay('_WAIT_POE_LOCK' => 1, $sigkey, $sigvalue, $channel);
+				return 1;
+			} elsif( $_[OBJECT]->{SIGNAL_KEY_HREF}->{ $sigkey }->{LOCK_RETRY_TIME} == 0 ) {
+				# LOCK_RETRY_TIME set to [0]...indefinite lock!
+				print "[_MANAGE_LOCKING] indefinite lock state [".$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{IS_LOCKED}."] for channel[$channel] - dropping signal [$sigkey]...swap signal for reset\n" if $_[OBJECT]->{SIGNAL_LOCK_CARP};
+				return 1;
 			}
-			my $signal_reload = {$sigkey => $sigvalue};
-			print "[_MANAGE_LOCKING] reloading this signal[$sigkey] into the siqnal queue\n" if $_[OBJECT]->{SIGNAL_LATCH_CARP};
-#			my $sq = $_[OBJECT]->{WXPOEIO_QUEUE};
-			my $sq = $_[OBJECT]->{WXPOEIO_QUEUE_TMP_HOLD};
-			push @$sq, $signal_reload;
-			$_[KERNEL]->delay('_WAIT_POE_LOCK' => 1, $sigkey, $sigvalue, $channel);
-			return 1;
 		}
 	}
 	$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{IS_NOISY} = 1;
 	$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{NOISE}->{$sigkey} = 1;
-	print "[_MANAGE_LOCKING] using WXPOEIO_CHANNELS channel [$channel] for signal [$sigkey] [".$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}."]\n" if $_[OBJECT]->{SIGNAL_LOOP_CARP};
+	print "[_MANAGE_LOCKING] using WXPOEIO_CHANNELS channel [$channel] for signal [$sigkey] [".$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}."]\n" if $_[OBJECT]->{SIGNAL_LOCK_CARP};
 	$_[KERNEL]->yield('_TO_POE', $sigkey, $sigvalue);
 
 	return 1;
@@ -1332,8 +1454,16 @@ sub _clear_signal {
 	# Search for this signal!
 	if ( exists $_[OBJECT]->{WXPOEIO}->{ $sigkey } ) {
 
-		# clear all latch, locks and noise for signal
 		my $channel = $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{WXPOEIO_CHANNEL};
+		if( exists $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{SIGNAL_KILL_SIGVALUE} and defined $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{SIGNAL_KILL_SIGVALUE} ) {
+			if( $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{SIGNAL_KILL_SIGVALUE} != $sigvalue) {
+				## this signal set is not able to terminate the lock on this signal/channel
+				warn "[WXPOEIO - CLEAR SIGNAL] this sigkey[$sigkey] and sigval[$sigvalue]!=[".$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{SIGNAL_KILL_SIGVALUE}."] - cannot remove lock on channel[$channel].\n";
+				return 1;
+			}
+		}
+	
+		# clear all latch, locks and noise for signal
 		print " =[_CLEAR_SIGNAL] filtering channel [".$channel."]\n" if $_[OBJECT]->{CLEAR_SIGNAL_CARP};
 
 		$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{IS_LATCHED} = 0;
@@ -1375,7 +1505,7 @@ sub _clear_signal {
 	return 1;
 }
 
-# Time out a signal call to a locked channel
+# Timeout a signal call to a locked channel
 sub _wait_poe_lock {
 	# ARG0 = signal_key, ARG1 = signal_value
 	my( $sigkey, $sigvalue, $channel ) = @_[ ARG0, ARG1, ARG2 ];
@@ -1400,7 +1530,7 @@ sub _wait_poe_lock {
 			if($_[OBJECT]->{SIGNAL_KEY_HREF}->{$sig_key}->{RETRY_ATTEMPTS} > $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sig_key}->{LOCK_RETRY_TIME}) {
 				$count--;
 				$states->{$sig_key} = 0;
-				print " =[WXPOEIO LOCK LOOP] lock counted out for sigkey[$sigkey][$sig_key] val[$sigvalue] channel[".$channel."] active[".$states->{$sig_key}."] count[".$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sig_key}->{RETRY_ATTEMPTS}."] not_done[".$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sig_key}->{WAIT_BLOCKED}."]\n" if $_[OBJECT]->{SIGNAL_LOCK_CARP};
+				print " =[WXPOEIO WAIT_POE_LOCK LOOP] lock counted out for sigkey[$sigkey][$sig_key] val[$sigvalue] channel[".$channel."] active[".$states->{$sig_key}."] count[".$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sig_key}->{RETRY_ATTEMPTS}."] not_done[".$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sig_key}->{WAIT_BLOCKED}."]\n" if $_[OBJECT]->{SIGNAL_LOCK_CARP};
 				$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sig_key}->{WAIT_BLOCKED} = 0;
 #				$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{WAIT_LOCK} = 0;
 				$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sig_key}->{RETRY_ATTEMPTS} = 0;
@@ -1472,6 +1602,57 @@ sub _wait_on_lock {
 	}
 	print " =[WXPOEIO LOCK LOOP] wait on sigkey[$sigkey] lock - lock count [".$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{WAIT_LOCK_COUNT}."]\n" if $_[OBJECT]->{SIGNAL_LOCK_CARP};
 	$_[KERNEL]->delay('_WAIT_ON_LOCK_TIMEOUT' => 1, $sigkey, $sigvalue);
+	return 1;
+}
+
+# Kill signal settings - use to clear a DNS start/stop signal 
+sub _kill_signal {
+	# ARG0 = signal_key, ARG1 = signal_value, [Optional, ARG2 = _wxframe_manager]
+	my( $sigkey, $sigvalue ) = @_[ ARG0, ARG1 ];
+	print "[_CLEAR_SIGNAL] clear this signal [".$sigkey."]\n" if $_[OBJECT]->{CLEAR_SIGNAL_CARP};
+	# Search for this signal!
+	if ( exists $_[OBJECT]->{WXPOEIO}->{ $sigkey } ) {
+
+		# clear all latch, locks and noise for signal
+		my $channel = $_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{WXPOEIO_CHANNEL};
+		print " =[_CLEAR_SIGNAL] filtering channel [".$channel."]\n" if $_[OBJECT]->{CLEAR_SIGNAL_CARP};
+
+		$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{IS_LATCHED} = 0;
+		$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{IS_LOCKED} = 0;
+
+		if ( exists $_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{WAIT_LOCK} and $_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{WAIT_LOCK} ) {
+			$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{WAIT_LOCK} = 0;
+		}
+
+		if ( exists $_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{NOISE}->{$sigkey} ) {
+			delete $_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{NOISE}->{$sigkey};
+		}
+		print " =[_CLEAR_SIGNAL] clear signal latch, clear lock, clear wait, clear signal noise" if $_[OBJECT]->{CLEAR_SIGNAL_CARP};
+		
+		if ( scalar keys %{ $_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{NOISE} } == 0 ) {
+			$_[OBJECT]->{WXPOEIO_CHANNELS}->{$channel}->{IS_NOISY} = 0;
+			print ", clear channel noise" if $_[OBJECT]->{CLEAR_SIGNAL_CARP};
+		}
+		print " [".$channel."]\n" if $_[OBJECT]->{CLEAR_SIGNAL_CARP};
+
+		if ( exists $_[OBJECT]->{WXPOEIO_WAIT_SIGNALS_TO_UNLOCK}->{$channel} and scalar(keys $_[OBJECT]->{WXPOEIO_WAIT_SIGNALS_TO_UNLOCK}->{$channel})) {
+			my $states = $_[OBJECT]->{WXPOEIO_WAIT_SIGNALS_TO_UNLOCK}->{$channel};
+			foreach my $sig (keys %$states) {
+				if($states->{$sig}) {
+					$states->{$sig} = 0;
+#					$_[OBJECT]->{WXPOEIO_WAIT_CHANNEL_TO_UNLOCK}->{$sig} = 0;
+					print " =[_CLEAR_SIGNAL] clear block for sig[$sig] on channel[$channel]\n" if $_[OBJECT]->{CLEAR_SIGNAL_CARP};
+					$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sig}->{WAIT_BLOCKED} = 0;
+					$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sig}->{RETRY_ATTEMPTS} = 0;
+				}
+			}
+		}
+		
+	} else {
+		if ( $_[OBJECT]->{SIGNAL_LOOP_CARP} ) {
+			warn "Cannot clear an unregistered signal. Opps! [$sigkey]";
+		}
+	}
 	return 1;
 }
 
