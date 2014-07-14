@@ -1159,6 +1159,13 @@ sub _toWx {
 					$message = $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE};
 					$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = '';
 				}
+				if( exists $_[OBJECT]->{WXPOEIO_CHANNELS}->{FRAME_TO_FRAME}) {
+					# check signal key against FRAME_TO_FRAME channel
+					if($_[OBJECT]->{SIGNAL_KEY_HREF}->{ $sigkey }->{WXPOEIO_CHANNEL} eq 'FRAME_TO_FRAME') {
+						$status = 1;
+						$message = '';
+					}
+				}
 				if(defined $_[OBJECT]->{WXFRAME_MGR}) {
 					my $wxframe_obj = $_[OBJECT]->{WXFRAME_MGR}->frame_handle_by_key($wxframe);
 					if( my $ref = eval { $wxframe_obj->can($evt_meth) } ) {
