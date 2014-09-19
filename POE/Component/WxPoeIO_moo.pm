@@ -7,7 +7,7 @@ package WxPoeIO_moo;
 #######################################
 #   Package Credits
 #######################################
-#   this package is derived from...
+#   is derived from...
 ####
 # as of 2014.04.16:
 # POE::Component::SimpleLog (v. 1.05), Perl extension to manage a simple logging system for POE
@@ -30,7 +30,7 @@ use Carp;
 
 
 # Initialize our version
-our $VERSION = '0.002001';
+our $VERSION = '0.002006';
 
 has 'this_version' => (isa => 'Num', is => 'ro', builder => '__set_version' );
 has 'MY_SESSION' => (isa => 'Undef', is => 'rw', default => undef );
@@ -219,16 +219,16 @@ sub session_create {
 				# Config a signal [key] push for use...this is not the same as registing for a signal broadcast
 				'CONFIG_SIGNAL'	=>	"Config_signal",
 
-				# Register an IO session
-				'REGISTER_SESSION'	=>	"Register_session",
+				# Register an IO signal session
+				'REGISTER_SIGNAL'	=>	"Register_signal",
 
 				# Unregister an IO session
 				'UNREGISTER_SESSION'	=>	"UnRegister_session",
 
-				# Register an IO frame
+				# Register an IO frame - NOT USED
 				'REGISTER_FRAME'	=>	"Register_frame",
 
-				# Unregister an IO frame
+				# Unregister an IO frame - NOT USED
 				'UNREGISTER_FRAME'	=>	"UnRegister_frame",
 
 				# Register a wxframe to wxframe IO on FRAME_TO_FRAME channel
@@ -278,6 +278,9 @@ sub session_create {
 
 				# SIGNAL SOMETHING to WxFrame!
 				'TO_WX'			=>	"_toWx",
+
+				# SIGNAL a value KEY to another WxFrame!
+				'_TO_WXFRAME'			=>	"_toWxFrame",
 
 				# export method to obtain the pointer to the signal queue
 				'EXPORT_SIG_QUEUE_PTR' => "export_queue_ptr",
@@ -396,11 +399,11 @@ sub Config_signal {
 }
 
 # Register a session to watch/wait for io signal
-sub Register_session {
+sub Register_signal {
 	# Get the arguments
 	my $args = $_[ ARG0 ];
 
-	my $carp = 0;
+	my $carp = 1;
 	if( exists $args->{CARP_REG} ) {
 		$carp = $args->{CARP_REG};
 	}
@@ -430,6 +433,17 @@ sub Register_session {
 		}
 	}
 	$args->{LOG_SESSION} = $args->{SESSION};
+
+	my $wxframe_mgr = 0;
+	if ( exists $args->{WXFRAME_MGR_TOGGLE} ) {
+		$wxframe_mgr = $args->{WXFRAME_MGR_TOGGLE};
+	}
+
+	my $frame = '_none_';
+	if ( exists $args->{TARGET_WXFRAME_IDENT} ) {
+		$frame = $args->{TARGET_WXFRAME_IDENT};
+	}
+
 	if ( defined $args->{EVT_METHOD_POE} or defined $args->{EVT_METHOD_LOG} or defined $args->{EVT_METHOD_WXFRAME}) {
 		print "[REGISTER WXPOE SESS] [".$args->{SIGNAL_KEY}."] useable signal method available...complete registration\n" if $carp;
 	} else {
@@ -438,32 +452,91 @@ sub Register_session {
 		}
 		return undef;
 	}
-	if($args->{EVT_METHOD_POE}=~/^__([\w_\-]+)__$/) {
-		print "[REGISTER WXPOE SESS] [".$args->{SIGNAL_KEY}."] this method [".$args->{EVT_METHOD_POE}."] [$1] belongs to the main session\n" if $carp;
-		$args->{EVT_METHOD_POE} = $1;
-		$args->{SESSION} = '_MAIN_WXSESSION_ALIAS_';
+	
+	####
+	## possible future feature...note that client control is better managed by the WxPoeServer
+	####
+	if ( exists $args->{DIRECT_SERVER_SESSION_ALIASKEY} and $args->{DIRECT_SERVER_SESSION_ALIASKEY} ) {
+		#$args->{SESSION} = $args->{DIRECT_SERVER_SESSION_ALIASKEY};
+	}
+	
+	if ( defined $args->{EVT_METHOD_POE} ) {
+		####
+		## Ok - register main session signal for an EVT_METHOD_POE (i.e., a method in the WxPoeServer)
+		####
+		if($args->{EVT_METHOD_POE}=~/^__([\w_\-]+)__$/) {
+			print "[REGISTER WXPOE MAIN] [".$args->{SIGNAL_KEY}."] this method [".$args->{EVT_METHOD_POE}."] [$1] belongs to the main session\n" if $carp;
+			$args->{EVT_METHOD_POE} = $1;
+			$args->{SESSION} = '_MAIN_WXSESSION_ALIAS_';
+		}
+		## - then register within the WXPOEIO hash structure
+		if ( ! exists $_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} } ) {
+			$_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} } = {};
+		}
+		if ( ! exists $_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} } ) {
+				$_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} } = {};
+		}
+
+		# Store the POE event method in the signal key hash
+		if ( exists $_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{EVT_METHOD_POE} ) {
+			# Duplicate record...
+			if ( $_[OBJECT]->{SIGNAL_DUPLICATE_CARP} ) {
+				warn "[WXPOEIO REGISTER] Duplicate signal -> sigkey[".$args->{SIGNAL_KEY}."] Session[".$args->{SESSION}."] Event[".$args->{EVT_METHOD_POE}."] ... ignoring  ";
+				return undef;
+			}
+		} else {
+			$_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{EVT_METHOD_POE} =  $args->{EVT_METHOD_POE};
+			print "[REGISTER WXPOE SESS] [".$args->{SIGNAL_KEY}."] registering Poe Method [".$args->{EVT_METHOD_POE}."] under SESSION key [".$args->{SESSION}."]\n" if $carp;
+		}
 	}
 
-#	# register within the WXPOEIO hash structure
-	if ( ! exists $_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} } ) {
-		$_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} } = {};
-	}
-
-	if ( ! exists $_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} } ) {
-			$_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} } = {};
-	}
-
-	# Store the POE event method in the signal key hash
-	if ( exists $_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{EVT_METHOD_POE} ) {
-		# Duplicate record...
-		if ( $_[OBJECT]->{SIGNAL_DUPLICATE_CARP} ) {
-			warn "[WXPOEIO REGISTER] Duplicate signal -> sigkey[".$args->{SIGNAL_KEY}."] Session[".$args->{SESSION}."] Event[".$args->{EVT_METHOD_POE}."] ... ignoring  ";
+	if( $frame !~ /^_none_$/i ) {
+		print "[REGISTER WXPOE SESS - FRAME] registering frame [$frame] on [".$args->{SIGNAL_KEY}."] \n" if $carp;
+		if ( ! defined $args->{EVT_METHOD_WXFRAME} ) {
+			if ( $_[OBJECT]->{SIGNAL_LOOP_CARP} ) {
+				warn "Did not get an WxEvtMethod for SignalKey: ".$args->{SIGNAL_KEY}." and wxFrame Object: ".$args->{WXFRAME_OBJ};
+			}
 			return undef;
 		}
-	} else {
-		$_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{EVT_METHOD_POE} =  $args->{EVT_METHOD_POE};
-		print "[REGISTER WXPOE SESS] [".$args->{SIGNAL_KEY}."] registering Poe Method [".$args->{EVT_METHOD_POE}."] under SESSION key [".$args->{SESSION}."]\n" if $carp;
+		
+		# register within the WXPOEIO hash structure
+		if ( ! exists $_[OBJECT]->{WXFRAMEIO}->{$frame} ) {
+			$_[OBJECT]->{WXFRAMEIO}->{$frame} = {};
+		}
+
+		if ( ! exists $_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} } ) {
+			$_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} } = {};
+		}
+		print "[REGISTER WXPOE SESS - FRAME] frame [$frame] registered for SignalKey: [".$args->{SIGNAL_KEY}."]\n" if $carp;
+
+		# Finally store the wx method in the signal key method hash
+		if ( ! exists $_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} }->{WX_METHODS} ) {
+			$_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} }->{WX_METHODS} = {};
+		}
+		$_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} }->{WX_METHODS}->{ $args->{EVT_METHOD_WXFRAME} } = 1;
+		print "[REGISTER WXPOE SESS - FRAME] evt methods, evt[".$args->{EVT_METHOD_WXFRAME}."]" if $carp;
+
+		# If an update method exists, store the wx update in the signal key method hash
+		if( exists $args->{EVT_UPDATE_WXFRAME} and $args->{EVT_UPDATE_WXFRAME}) {
+			if ( ! exists $_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} }->{WX_UPDATE} ) {
+				$_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} }->{WX_UPDATE} = {};
+			}
+			$_[OBJECT]->{WXFRAMEIO}->{$frame}->{ $args->{SIGNAL_KEY} }->{WX_UPDATE}->{ $args->{EVT_UPDATE_WXFRAME} } = 1;
+			print ", evt_up[".$args->{EVT_UPDATE_WXFRAME}."]" if $carp;
+		}
+
+		if(!exists $_[OBJECT]->{WXFRAMEIO}->{$frame}->{USE_WXFRAME_MGR}) {
+			# set USE_WXFRAME_MGR to falsy as default
+			$_[OBJECT]->{WXFRAMEIO}->{$frame}->{USE_WXFRAME_MGR} = 0; 
+		}
+		if($wxframe_mgr) {
+			$_[OBJECT]->{WXFRAMEIO_WXSIGHANDLE}->{$frame}->{USE_WXFRAME_MGR} = 1; 
+		} else {
+			$_[OBJECT]->{WXFRAMEIO_WXSIGHANDLE}->{$frame}->{WXFRAME_OBJ} = $args->{WXFRAME_OBJ};
+		}
+		print " registered for SignalKey: [".$args->{SIGNAL_KEY}."]\n" if $carp;
 	}
+
 
 	if(exists $args->{EVT_METHOD_LOG} and $args->{EVT_METHOD_LOG}=~/^__([\w_\-]+)__$/) {
 		print "[REGISTER POE LOGGER SESS FRAME] this method [".$args->{EVT_METHOD_LOG}."] [$1] belongs to the main session\n" if $carp;
@@ -489,24 +562,25 @@ sub Register_session {
 		} else {
 			$_[OBJECT]->{WXPOEIO_LOG}->{ $args->{SIGNAL_KEY} }->{ $args->{LOG_SESSION} }->{EVT_METHOD_LOG} =  $args->{EVT_METHOD_LOG};
 		}
+
 	}
 	
 	# Also check for a FRAME event method in the signal key hash
 #	if ( ! exists $args->{EVT_METHOD_WXFRAME} or ! $args->{EVT_METHOD_WXFRAME}) {
-	if (exists $args->{EVT_UPDATE_WXFRAME} and $args->{EVT_UPDATE_WXFRAME}) {
-		if ( exists $_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{EVT_UPDATE_WXFRAME} ) {
-			# Duplicate record...
-			if ( $_[OBJECT]->{SIGNAL_DUPLICATE_CARP} ) {
-				#warn "Tried to register a duplicate! -> LogName: ".$args->{SIGNAL_KEY}." -> Target Session: ".$args->{SESSION}." -> Event: ".$args->{EVT_METHOD_WXFRAME};
-				warn "[WXPOEIO REGISTER] Duplicate signal -> sigkey[".$args->{SIGNAL_KEY}."] Session[".$args->{SESSION}."] Event[".$args->{EVT_UPDATE_WXFRAME}."] ... ignoring  ";
-				return undef;
-			}
-		} else {
-			$_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{EVT_UPDATE_WXFRAME} =  $args->{EVT_UPDATE_WXFRAME};
-		#	print "[REGISTER WXPOE SESS] register UPDATE method [".$args->{EVT_UPDATE_WXFRAME}."] for signal[".$args->{SIGNAL_KEY}."]\n" if $carp;
-			print "[REGISTER WXPOE SESS] [".$args->{SIGNAL_KEY}."] registering UPDATE Method [".$args->{EVT_UPDATE_WXFRAME}."] under SESSION key [".$args->{SESSION}."]\n" if $carp;
-		}
-	}
+#	if (exists $args->{EVT_UPDATE_WXFRAME} and $args->{EVT_UPDATE_WXFRAME}) {
+#		if ( exists $_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{EVT_UPDATE_WXFRAME} ) {
+#			# Duplicate record...
+#			if ( $_[OBJECT]->{SIGNAL_DUPLICATE_CARP} ) {
+#				#warn "Tried to register a duplicate! -> LogName: ".$args->{SIGNAL_KEY}." -> Target Session: ".$args->{SESSION}." -> Event: ".$args->{EVT_METHOD_WXFRAME};
+#				warn "[WXPOEIO REGISTER] Duplicate signal -> sigkey[".$args->{SIGNAL_KEY}."] Session[".$args->{SESSION}."] Event[".$args->{EVT_UPDATE_WXFRAME}."] ... ignoring  ";
+#				return undef;
+#			}
+#		} else {
+#			$_[OBJECT]->{WXPOEIO}->{ $args->{SIGNAL_KEY} }->{ $args->{SESSION} }->{EVT_UPDATE_WXFRAME} =  $args->{EVT_UPDATE_WXFRAME};
+#		#	print "[REGISTER WXPOE SESS] register UPDATE method [".$args->{EVT_UPDATE_WXFRAME}."] for signal[".$args->{SIGNAL_KEY}."]\n" if $carp;
+#			print "[REGISTER WXPOE SESS] [".$args->{SIGNAL_KEY}."] registering UPDATE Method [".$args->{EVT_UPDATE_WXFRAME}."] under SESSION key [".$args->{SESSION}."]\n" if $carp;
+#		}
+#	}
 
 	print "[REGISTER WXPOE SESS] all registered for SignalKey: [".$args->{SIGNAL_KEY}."]\n" if $carp;
 	# All registered!
@@ -735,9 +809,9 @@ sub Register_frame_to_frame {
 		}
 		return undef;
 	}
-	my $frame = 'DEFAULT';
-	if ( exists $args->{WXFRAME_IDENT} ) {
-		$frame = $args->{WXFRAME_IDENT};
+	my $frame = undef;
+	if ( exists $args->{TARGET_WXFRAME_IDENT} ) {
+		$frame = $args->{TARGET_WXFRAME_IDENT};
 	}
 	if ( ! defined $frame ) {
 		if ( $_[OBJECT]->{SIGNAL_LOOP_CARP} ) {
@@ -873,6 +947,27 @@ sub fire_signal {
 		$_[OBJECT]->{SIGNAL_KEY_HREF}->{$sigkey}->{SIGNAL_HOLD_TMP} = {$sigkey => $sigvalue};
 	}
 	$_[KERNEL]->yield('_MANAGE_TO_POE', $sigkey, $sigvalue);
+	return;
+}
+
+# Fire a single signal to another frame
+sub fire_interframe_signal {
+	# ARG0 = signal_key, ARG1 = signal_value
+	my( $sigkey, $sigvalue, $key ) = @_[ ARG0, ARG1, ARG2 ];
+	print "[WXPOEIO FIRE] fired: sigkey[$sigkey] val[$sigvalue]\n" if $_[OBJECT]->{SIGNAL_LOOP_CARP};
+	if( !exists $_[OBJECT]->{SIGNAL_KEYS}->{$sigkey}) {
+		# warn...a potential configuration error
+		warn "No SIGNAL_KEY for [$sigkey] in SIGNAL_KEY hash! Check signal key settings";
+		next;
+	}
+	if( exists $_[OBJECT]->{WXPOEIO_CHANNELS}->{FRAME_TO_FRAME}) {
+		# check signal key against FRAME_TO_FRAME channel
+		if($_[OBJECT]->{SIGNAL_KEY_HREF}->{ $sigkey }->{WXPOEIO_CHANNEL} eq 'FRAME_TO_FRAME') {
+			print "[WXPOEIO INTERFRAME FIRE] sending sigkey[$sigkey] to_wxframe\n" if $_[OBJECT]->{SIGNAL_LOOP_CARP};
+			$_[KERNEL]->yield('_TO_WXFRAME', $sigkey, $sigvalue, $key);
+			next;
+		}
+	}
 	return;
 }
 
@@ -1182,6 +1277,48 @@ sub _toWx {
 					my $wxframe_obj = $_[OBJECT]->{WXFRAMEIO_WXSIGHANDLE}->{$wxframe}->{WXFRAME_OBJ};
 					$wxframe_obj->$evt_meth( $sigkey, $sigvalue, $status, $message, );
 				}
+			}
+		}
+	}
+	return 1;
+}
+
+# Where INTER-FRAME work is done...
+sub _toWxFrame {
+	# ARG0 = signal_key, ARG1 = signal_value, [Optional, ARG2 = data_key]
+	my( $self, $sigkey, $sigvalue, $key ) = @_[ OBJECT, ARG0, ARG1, ARG2 ];
+	if($self->{TOWX_CARP}) {
+		print " send to WXFRAME - send response [".$sigkey."]";
+		print " datakey[$key]" if defined $key;
+		print "\n";
+	}
+	# Search through the registrations for this specific one
+	foreach my $wxframe ( keys %{ $_[OBJECT]->{WXFRAMEIO} } ) {
+		# Scan frame key for signal key
+		print "[toWxFrame] scan frame [$wxframe] for sigkey[$sigkey]\n" if $self->{TOWX_CARP};
+		if ( exists $_[OBJECT]->{WXFRAMEIO}->{$wxframe}->{$sigkey} ) {
+			# Scan for the proper evt_method!
+			foreach my $evt_up ( keys %{ $_[OBJECT]->{WXFRAMEIO}->{$wxframe}->{$sigkey}->{WX_UPDATE} } ) {
+				print "[toWxFrame] found interframe method[$evt_up] for frame [$wxframe] for sigkey[$sigkey]\n" if $self->{TOWX_CARP};
+#				my $key = $sigkey . "_" . $sigvalue; ## avoiding potential '0' keys
+#				my $status = 0;
+#				my $message = $key;
+#				my $layout_data_method = '_none_';
+#				if( exists $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS}) {
+#					$status = $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS};
+#					$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{STATUS} = 0;
+#				}
+#				if( exists $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE}) {
+#					$message = $_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE};
+#					$_[OBJECT]->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = '';
+#				}
+				if(!$key) { $key = 0; } ## send a falsy key as default
+				if(defined $_[OBJECT]->{WXFRAME_MGR}) {
+					my $wxframe_obj = $_[OBJECT]->{WXFRAME_MGR}->frame_handle_by_key($wxframe);
+					print "[toWxFrame] using wfmgr for sending key[$key] to wxframe[$wxframe_obj] method[$evt_up] for sigkey[$sigkey] sigvalue[$sigvalue]\n" if $self->{TOWX_CARP};
+					$wxframe_obj->$evt_up( $sigkey, $sigvalue, $key, );
+				}
+				## else, fail silently...nothing is return to the wxframe
 			}
 		}
 	}
