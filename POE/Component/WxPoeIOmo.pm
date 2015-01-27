@@ -79,6 +79,8 @@ has 'WXPOEIO_QUEUE' => (isa => 'ArrayRef', is => 'rw', default => sub { [] });
 has 'WXPOEIO_QUEUE_TMP_HOLD' => (isa => 'ArrayRef', is => 'rw', default => sub { [] });
 # The wxframe manager pointer
 has 'WFRAME_MGR' => (isa => 'Undef', is => 'rw', default => undef );
+# The Wx Main App pointer
+has 'WX_MAIN_APP' => (isa => 'Undef', is => 'rw', default => undef );
 # The signal results holding href
 has 'WXFRAMEIO_RESULTS' => (isa => 'HashRef', is => 'rw', default => sub { {} });
 ## probably a bad idea...but it works
@@ -130,7 +132,7 @@ sub signal_queue_ptr {
 	}
 	return $self->{WXPOEIO_QUEUE};
 }
-sub frame_mgr_ptr {
+sub frame_mgr_ptr { ## remove
 	my $self = shift;
 	if(@_) {
 		## no error checking...
@@ -138,13 +140,21 @@ sub frame_mgr_ptr {
 	}
 	return $self->{WXFRAME_MGR};
 }
-sub wxframe_mgr_ptr {
+sub wxframe_mgr_ptr { ## remove
 	my $self = shift;
 	if(@_) {
 		## no error checking...
 		$self->{WXFRAME_MGR} = shift;
 	}
 	return $self->{WXFRAME_MGR};
+}
+sub wx_main_app_ptr {
+	my $self = shift;
+	if(@_) {
+		## no error checking...
+		$self->{WX_MAIN_APP} = shift;
+	}
+	return $self->{WX_MAIN_APP};
 }
 sub process_mgr_ptr {
 	my $self = shift;
@@ -320,11 +330,17 @@ sub session_create {
 				# SIGNAL a value KEY to another WxFrame!
 				'_TO_WXFRAME'			=>	"_toWxFrame",
 
+				# Signal a message - POE to Wx - using a integer value message href
+				'POE_MESSAGING'		=>	"_poe_messaging",
+
+				# SIGNAL a value KEY to main_app directed WxFrame
+				'_TO_WX_APP'			=>	"_to_wx_app",
+
 				# export method to obtain the pointer to the signal queue
 				'EXPORT_SIG_QUEUE_PTR' => "export_queue_ptr",
 
 				# import method to set a pointer to the wxframe manager
-				'SET_WXFRAME_MGR' => "import_frame_mgr_ptr",
+				'SET_WX_MAIN_APP_PTR' => "import_wx_main_app_ptr",
 				
 				# We are done!
 				'SHUTDOWN'	=>	"StopIO",
@@ -1037,8 +1053,8 @@ sub tripfire_signal {
 	my $self = shift;
 	my (%pms) = @_;
 	my $carp = 0;
-	if(exists $pms{carp}) {
-		$carp = $pms{carp};
+	if(exists $pms{trace}) {
+		$carp = $pms{trace};
 	}
 	my $sigvalue = 0;
 	if(exists $pms{sigvalue}) {
@@ -1110,8 +1126,8 @@ sub _manage_to_poe {
 	if ( exists $self->{WXPOEIO}->{ $sigkey } ) {
 
 		# Test for signal latch
-		#  latching discards follow same signal until the latch expires.
-		#  follow on signal are assumed to be bad signals
+		#  latching discards a follow-on same signal until the latch expires.
+		#  follow on signals are assumed to be bad signals
 
 		if($self->{TRACE_SIGNAL_PATH_ALL} or ($self->{TRACE_SIGNAL_PATH_SEL} and $self->{SIGNAL_KEY_HREF}->{$sigkey}->{TRACE}) ) {
 			my $message = "[_MANAGE_TO_POE] check latch sigkey[$sigkey] val[$sigvalue]";
@@ -1440,6 +1456,83 @@ sub _to_poe {
 	return 0;
 }
 
+# Where the poe message work is started...
+sub _poe_messaging {
+	# ARG0 = signal_key, ARG1 = integer_value, [Optional, ARG2 = message hash]
+	my( $self, $sigkey, $intval, $mess_href ) = @_[ OBJECT, ARG0, ARG1, ARG2 ];
+	
+	if($self->{TRACE_SIGNAL_PATH_ALL} or ($self->{TRACE_SIGNAL_PATH_SEL} and $self->{SIGNAL_KEY_HREF}->{$sigkey}->{TRACE}) ) {
+		my $message = "[_MANAGE_TO_POE] check-in signal sigkey[$sigkey] intval[$intval]";
+		$self->trace_message($message);
+	}
+
+	# Search for this signal!
+	if ( exists $self->{WXPOEIO}->{ $sigkey } ) {
+
+		# Test for signal trap
+		#  trapping discards a follow-on same signal until the trap expires.
+		#  follow on signals are assumed to be bad signals
+
+		if($self->{TRACE_SIGNAL_PATH_ALL} or ($self->{TRACE_SIGNAL_PATH_SEL} and $self->{SIGNAL_KEY_HREF}->{$sigkey}->{TRACE}) ) {
+			my $message = "[_POE_MESSAGING] check trap for sigkey[$sigkey]";
+			$self->trace_message($message);
+		}
+
+		# Test for whether a trap has been specified for the signal call
+		# if no trap, send to wxframe (no signal locking on POE side)
+		if ( !exists $self->{SIGNAL_KEY_HREF}->{$sigkey}->{TRAP} or !$self->{SIGNAL_KEY_HREF}->{$sigkey}->{TRAP} ) {
+
+			if($self->{TRACE_SIGNAL_PATH_ALL} or ($self->{TRACE_SIGNAL_PATH_SEL} and $self->{SIGNAL_KEY_HREF}->{$sigkey}->{TRACE}) ) {
+				my $message = "[_POE_MESSAGING] no trap on sigkey[$sigkey] sending to wx_frames";
+				$self->trace_message($message);
+			}
+
+			$_[KERNEL]->yield('_TO_WX_APP', $sigkey, $intval, $mess_href);
+			return 1;
+		}
+		
+		# Trapping is expected
+		# Test for whether the signal call has been trapped
+		if ( !exists $self->{SIGNAL_KEY_HREF}->{$sigkey}->{IS_TRAPPED}  or !$self->{SIGNAL_KEY_HREF}->{$sigkey}->{IS_TRAPPED}) {
+			# no latch; set latch and continue to POE
+
+			if($self->{TRACE_SIGNAL_PATH_ALL} or ($self->{TRACE_SIGNAL_PATH_SEL} and $self->{SIGNAL_KEY_HREF}->{$sigkey}->{TRACE}) ) {
+				my $message = "[_POE_MESSAGING] trap not yet set on sigkey[$sigkey] ... trapped now!";
+				$self->trace_message($message);
+			}
+
+			$self->{SIGNAL_KEY_HREF}->{$sigkey}->{IS_TRAPPED} = 1;
+			$self->{WXPOEIO_WAIT_SIGNAL_TRAP}->{$sigkey} = 1;
+			$self->{SIGNAL_KEY_HREF}->{$sigkey}->{TRAP_ATTEMPTS} = 1;
+			$_[KERNEL]->delay('_MANAGE_TRAPPING' => 1, $sigkey, $intval);
+
+			# send to wx_frames for message handling
+			$_[KERNEL]->yield('_TO_WX_APP', $sigkey, $intval, $mess_href);
+			return 1;
+		}
+
+		if($self->{TRACE_SIGNAL_PATH_ALL} or ($self->{TRACE_SIGNAL_PATH_SEL} and $self->{SIGNAL_KEY_HREF}->{$sigkey}->{TRACE}) ) {
+			my $message = "[_POE_MESSAGING] sigkey[$sigkey] is trapped, discarding this duplicate signal...doing nothing";
+			$self->trace_message($message);
+		}
+
+	} else {
+		# Ignore this signalkey
+		if ( $self->{CROAK_ON_ERROR} ) {
+			my $message = "[_POE_MESSAGING] Got this Signal_key: [$sigkey] -> Ignoring it because it is not registered!";
+			warn "$message";
+			$self->log_message($message);
+		}
+		if ( $self->{DIE_ON_ERROR} ) {
+			die "\t[_POE_MESSAGING] No SIGNAL, dying for a fix\n";
+		}
+		return 0;
+	}
+
+	# All done!
+	return 1;
+}
+
 
 # Stow the results of to_poe signal...and send response (end signal)
 sub _set_results_and_end {
@@ -1449,6 +1542,7 @@ sub _set_results_and_end {
 	my $key = $sigkey . "_" . $sigvalue; ## avoiding potential '0' keys
 	$self->{WXFRAMEIO_RESULTS}->{$key}->{STATUS} = 0;
 	$self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = '';
+	$self->{WXFRAMEIO_RESULTS}->{$key}->{DHREF} = undef;
 	$self->{WXFRAMEIO_RESULTS}->{$key}->{LAYOUT_OBJ_METHOD} = '_default_';
 	if($res_href=~/HASH/i) {
 		if(exists $res_href->{status}) {
@@ -1458,6 +1552,10 @@ sub _set_results_and_end {
 		if(exists $res_href->{message}) {
 			$self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = $res_href->{message};
 			delete $res_href->{message};
+		}
+		if(exists $res_href->{href}) {
+			$self->{WXFRAMEIO_RESULTS}->{$key}->{DHREF} = $res_href->{href};
+			delete $res_href->{href};
 		}
 		if(exists $res_href->{layout_obj_method}) {
 			$self->{WXFRAMEIO_RESULTS}->{$key}->{LAYOUT_OBJ_METHOD} = $res_href->{layout_obj_method};
@@ -1610,9 +1708,11 @@ sub _toWx {
 
 					my $key = $sigkey . "_" . $sigvalue; ## avoiding potential '0' keys
 					my $status = 0;
+					my $dhref = undef;
 					my $message = 'null';
-					my %base_keys = (STATUS => 1, MESSAGE => 1);
+					my %base_keys = (STATUS => 1, MESSAGE => 1, DHREF => 1);
 					foreach my $bkey (keys %base_keys) {
+						if(!$base_keys{$bkey}) { next; }
 						if($bkey=~/STATUS/) {
 							$status = $self->{WXFRAMEIO_RESULTS}->{$key}->{STATUS};
 							delete $self->{WXFRAMEIO_RESULTS}->{$key}->{STATUS};
@@ -1621,19 +1721,21 @@ sub _toWx {
 							$message = $self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE};
 							delete $self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE};
 						}
-					}
-					my $adds = undef;
-					if(scalar(keys { $self->{WXFRAMEIO_RESULTS}->{$key} })) {
-						foreach my $rkey (keys { $self->{WXFRAMEIO_RESULTS}->{$key} }) {
-							$adds->{extended_info}->{$rkey} = $self->{WXFRAMEIO_RESULTS}->{$key}->{$rkey};
-							delete $self->{WXFRAMEIO_RESULTS}->{$key}->{$rkey};
+						if($bkey=~/DHREF/) {
+							$dhref = $self->{WXFRAMEIO_RESULTS}->{$key}->{DHREF};
+							$self->{WXFRAMEIO_RESULTS}->{$key}->{DHREF} = undef;
 						}
 					}
-					if(defined $self->{WXFRAME_MGR}) {
-						my $wxframe_obj = $self->{WXFRAME_MGR}->frame_handle_by_key($wxframe);
-						$wxframe_obj->$evt_up( $sigkey, $sigvalue, $status, $message, $adds, );
+					if(!defined $self->{WX_MAIN_APP}) {
+						warn "[WXPOEIO - To WX] failed to find Main App ptr. Application fails...at line [".__LINE__."]\n";
+						die "\tdying to fix...\n";
+						## else, fail silently...nothing is returned to the wxframe
+						return undef;
 					}
-					## else, fail silently...nothing is returned to the wxframe
+					my $wxframe_obj = $self->{WX_MAIN_APP}->getWxFramePtr($wxframe);
+					if( my $ref = eval { $wxframe_obj->can($evt_up) } ) {
+						$wxframe_obj->$evt_up( $sigkey, $sigvalue, $status, $message, $dhref );
+					}
 				}
 				return 1;
 			}
@@ -1646,46 +1748,52 @@ sub _toWx {
 
 				my $key = $sigkey . "_" . $sigvalue; ## avoiding potential '0' keys
 				my $status = 0;
+				my $dhref = undef;
 				my $message = 'null';
+				my %base_keys = (STATUS => 1, MESSAGE => 0, DHREF => undef);
+				foreach my $bkey (keys %base_keys) {
+						if(!$base_keys{$bkey}) { next; }
+						if($bkey=~/STATUS/) {
+							$status = $self->{WXFRAMEIO_RESULTS}->{$key}->{STATUS};
+							delete $self->{WXFRAMEIO_RESULTS}->{$key}->{STATUS};
+						}
+						if($bkey=~/MESSAGE/) {
+							$message = $self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE};
+							delete $self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE};
+						}
+						if($bkey=~/DHREF/) {
+							$dhref = $self->{WXFRAMEIO_RESULTS}->{$key}->{DHREF};
+							$self->{WXFRAMEIO_RESULTS}->{$key}->{DHREF} = undef;
+						}
+					}
 				my $data_method = '_default_';
-				if( exists $self->{WXFRAMEIO_RESULTS}->{$key}->{STATUS}) {
-					$status = $self->{WXFRAMEIO_RESULTS}->{$key}->{STATUS};
-					$self->{WXFRAMEIO_RESULTS}->{$key}->{STATUS} = 0;
-				}
-				if( exists $self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE}) {
-					$message = $self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE};
-					$self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = '';
-				}
 				if( exists $self->{WXPOEIO_CHANNELS}->{FRAME_TO_FRAME}) {
 					# check signal key against FRAME_TO_FRAME channel
 					if($self->{SIGNAL_KEY_HREF}->{ $sigkey }->{WXPOEIO_CHANNEL} eq 'FRAME_TO_FRAME') {
 						$status = 1;
 						$message = '';
+						$dhref = undef;
 					}
 				}
-				if(defined $self->{WXFRAME_MGR}) {
-					my $wxframe_obj = $self->{WXFRAME_MGR}->frame_handle_by_key($wxframe);
-					$wxframe_obj->$evt_meth( $sigkey, $sigvalue, $status, $message, );
+				if(!defined $self->{WX_MAIN_APP}) {
+					warn "[WXPOEIO - To WX] failed to find Main App ptr. Application fails...at line [".__LINE__."]\n";
+					die "\tdying to fix...\n";
+					## else, fail silently...nothing is returned to the wxframe
+					return undef;
 				}
-				if(defined $self->{WXFRAME_MGR}) {
-					my $wxframe_obj = $self->{WXFRAME_MGR}->frame_handle_by_key($wxframe);
-					if( my $ref = eval { $wxframe_obj->can($evt_meth) } ) {
-						$wxframe_obj->$evt_meth( $sigkey, $sigvalue, $status, $message, );
-					} else {
-						if ( $self->{CROAK_ON_ERROR} ) {
-							my $message = "[WXPOEIO TO-WX] Opps! No valid event method [$evt_meth] defined within wxFrame for sigkey[$sigkey]";
-							warn "$message";
-							$self->log_message($message);
-						}
-						if ( $self->{DIE_ON_ERROR} ) {
-							die "\t[WXPOEIO TO-WX] evt_method [$evt_meth] not configured, dying for a fix\n";
-						}
-						next;
+				my $wxframe_obj = $self->{WX_MAIN_APP}->getWxFramePtr($wxframe);
+				if( my $ref = eval { $wxframe_obj->can($evt_meth) } ) {
+					$wxframe_obj->$evt_meth( $sigkey, $sigvalue, $status, $dhref, $message, );
+				} else {
+					if ( $self->{CROAK_ON_ERROR} ) {
+						my $message = "[WXPOEIO TO-WX] Opps! No valid event method [$evt_meth] defined within wxFrame for sigkey[$sigkey]";
+						warn "$message";
+						$self->log_message($message);
 					}
-				} elsif ( exists $self->{WXFRAMEIO_WXSIGHANDLE}->{$wxframe}->{WXFRAME_OBJ} ) {
-					## same as above...
-					my $wxframe_obj = $self->{WXFRAMEIO_WXSIGHANDLE}->{$wxframe}->{WXFRAME_OBJ};
-					$wxframe_obj->$evt_meth( $sigkey, $sigvalue, $status, $message, );
+					if ( $self->{DIE_ON_ERROR} ) {
+						die "\t[WXPOEIO TO-WX] evt_method [$evt_meth] not configured, dying for a fix\n";
+					}
+					next;
 				}
 			}
 		}
@@ -1726,6 +1834,56 @@ sub _toWxFrame {
 		}
 	}
 	return 1;
+}
+
+# Where notice of message is send to the wxFrame via the Main App...
+sub _to_wx_app {
+	# ARG0 = signal_key, ARG1 = integer_value, [Optional, ARG2 = message hash]
+	my( $self, $sigkey, $intval, $mess_href ) = @_[ OBJECT, ARG0, ARG1, ARG2 ];
+	
+	if($self->{TRACE_SIGNAL_PATH_ALL} or ($self->{TRACE_SIGNAL_PATH_SEL} and $self->{SIGNAL_KEY_HREF}->{$sigkey}->{TRACE}) ) {
+		my $message = "[WXPOEIO TO_WX_APP] check-in signal sigkey[$sigkey] intval[$intval]";
+		$self->trace_message($message);
+	}
+
+	# Search through the registrations for this specific one
+	foreach my $wxframe ( keys %{ $self->{WXFRAMEIO} } ) {
+		# Scan frame key for signal key
+		if ( exists $self->{WXFRAMEIO}->{$wxframe}->{$sigkey} ) {
+			# Scan for the proper evt_method!
+			## first check for if this is an update notice
+			foreach my $evt_meth ( keys %{ $self->{WXFRAMEIO}->{$wxframe}->{$sigkey}->{WX_METHODS} } ) {
+
+				if($self->{TRACE_SIGNAL_PATH_ALL} or ($self->{TRACE_SIGNAL_PATH_SEL} and $self->{SIGNAL_KEY_HREF}->{$sigkey}->{TRACE}) ) {
+					my $message = "[WXPOEIO TO_WX_APP] found evt method[$evt_meth] for frame [$wxframe] for sigkey[$sigkey]";
+					$self->trace_message($message);
+				}
+
+				if(!defined $self->{WX_MAIN_APP}) {
+					warn "[WXPOEIO TO_WX_APP] failed to find Main App ptr. Application fails...at line [".__LINE__."]\n";
+					die "\tdying to fix...\n";
+					## else, fail silently...nothing is returned to the wxframe
+					return undef;
+				}
+				my $wxframe_obj = $self->{WX_MAIN_APP}->getWxFramePtr($wxframe);
+				if( my $ref = eval { $wxframe_obj->can($evt_meth) } ) {
+					$wxframe_obj->$evt_meth( $intval, $mess_href, $sigkey, );
+				} else {
+					if ( $self->{CROAK_ON_ERROR} ) {
+						my $message = "[WXPOEIO TO_WX_APP] Opps! No valid event method [$evt_meth] defined within wxFrame for sigkey[$sigkey]";
+						warn "$message";
+						$self->log_message($message);
+					}
+					if ( $self->{DIE_ON_ERROR} ) {
+						die "\t[WXPOEIO TO_WX_APP] evt_method [$evt_meth] not configured, dying for a fix\n";
+					}
+					next;
+				}
+			}
+		}
+	}
+	return 1;
+
 }
 
 # And send SIGNAL RESULT to POE LOGGER SESSION...
@@ -2113,8 +2271,8 @@ sub _kill_signal {
 
 # manage (count-out) the trapping here
 sub _manage_trapping {
-	# ARG0 = signal_key, ARG1 = signal_value
-	my( $self, $sigkey, $sigvalue ) = @_[ OBJECT, ARG0, ARG1 ];
+	# ARG0 = signal_key, [optional: ARG1 = integer_value]
+	my( $self, $sigkey, $intval ) = @_[ OBJECT, ARG0, ARG1 ];
 
 	## check if trap is still in timeout
 	## if trap reaches timeout, loop ends
@@ -2128,7 +2286,7 @@ sub _manage_trapping {
 	my $states = $self->{WXPOEIO_WAIT_SIGNAL_TRAP};
 	my $count = 0;
 	
-	if($self->{TRACE_SIGNAL_LOCK}) {
+	if($self->{TRACE_SIGNAL_LOCK}) { ## use TRACE_SIGNAL_LOCK setting...this setting should be mostly off (falsy)
 		my $message = "{WXPOEIO - MANAGE TRAP] manage the trap back-sigkey[$sigkey] ct[".$self->{SIGNAL_KEY_HREF}->{$sigkey}->{LATCH_ATTEMPTS}."]";
 		$self->trace_message($message);
 	}
@@ -2169,7 +2327,7 @@ sub _manage_trapping {
 		return;
 	}
 	## continue until count goes to zero!
-	$_[KERNEL]->delay('_MANAGE_TRAPPING' => 1, $sigkey, $sigvalue);
+	$_[KERNEL]->delay('_MANAGE_TRAPPING' => 1, $sigkey, $intval);
 	return 1;
 }
 
@@ -2219,12 +2377,12 @@ sub export_queue_ptr {
 	return 1;
 }
 
-sub import_frame_mgr_ptr {
+sub import_wx_main_app_ptr {
 	my $ptr_var = $_[ ARG0 ];
-	if(!exists $_[OBJECT]->{WXFRAME_MGR}) {
-		$_[OBJECT]->{WXFRAME_MGR} = $ptr_var;
+	if(!exists $_[OBJECT]->{WX_MAIN_APP}) {
+		$_[OBJECT]->{WX_MAIN_APP} = $ptr_var;
 	}
-	$_[OBJECT]->{WXFRAME_MGR} = $ptr_var;
+	$_[OBJECT]->{WX_MAIN_APP} = $ptr_var;
 	return 1;
 }
 
