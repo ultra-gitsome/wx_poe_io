@@ -1542,24 +1542,26 @@ sub _set_results_and_end {
 	my $key = $sigkey . "_" . $sigvalue; ## avoiding potential '0' keys
 	$self->{WXFRAMEIO_RESULTS}->{$key}->{STATUS} = 0;
 	$self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = '';
+	$self->{WXFRAMEIO_RESULTS}->{$key}->{INTRGR} = 0;
 	$self->{WXFRAMEIO_RESULTS}->{$key}->{DHREF} = undef;
-	$self->{WXFRAMEIO_RESULTS}->{$key}->{LAYOUT_OBJ_METHOD} = '_default_';
 	if($res_href=~/HASH/i) {
 		if(exists $res_href->{status}) {
 			$self->{WXFRAMEIO_RESULTS}->{$key}->{STATUS} = $res_href->{status};
 			delete $res_href->{status};
 		}
 		if(exists $res_href->{message}) {
-			$self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = $res_href->{message};
+			## limit message string to 256 characters
+			my $m = substr($res_href->{message},0,256);
+			$self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = $m;
 			delete $res_href->{message};
+		}
+		if(exists $res_href->{int_ctr}) {
+			$self->{WXFRAMEIO_RESULTS}->{$key}->{INTRGR} = $res_href->{int_ctr};
+			delete $res_href->{int_ctr};
 		}
 		if(exists $res_href->{href}) {
 			$self->{WXFRAMEIO_RESULTS}->{$key}->{DHREF} = $res_href->{href};
 			delete $res_href->{href};
-		}
-		if(exists $res_href->{layout_obj_method}) {
-			$self->{WXFRAMEIO_RESULTS}->{$key}->{LAYOUT_OBJ_METHOD} = $res_href->{layout_obj_method};
-			delete $res_href->{layout_obj_method};
 		}
 	}
 	undef $res_href;
@@ -1657,14 +1659,21 @@ sub _update_signal {
 
 	my $key = $sigkey . "_" . $sigvalue; ## avoiding potential '0' keys
 	$self->{WXFRAMEIO_RESULTS}->{$key}->{STATUS} = 0;
+	$self->{WXFRAMEIO_RESULTS}->{$key}->{INTRGR} = 0;
 	$self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = '';
 	if($res_href=~/HASH/i) {
 		if(exists $res_href->{status}) {
 			$self->{WXFRAMEIO_RESULTS}->{$key}->{STATUS} = $res_href->{status};
 			delete $res_href->{status};
 		}
+		if(exists $res_href->{integer}) {
+			$self->{WXFRAMEIO_RESULTS}->{$key}->{INTRGR} = $res_href->{integer};
+			delete $res_href->{integer};
+		}
 		if(exists $res_href->{message}) {
-			$self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = $res_href->{message};
+			## limit message string to 256 characters
+			my $m = substr($res_href->{message},0,256);
+			$self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE} = $m;
 			delete $res_href->{message};
 		}
 		if(scalar(keys %$res_href)) {
@@ -1708,9 +1717,10 @@ sub _toWx {
 
 					my $key = $sigkey . "_" . $sigvalue; ## avoiding potential '0' keys
 					my $status = 0;
+					my $integer = 0;
 					my $dhref = undef;
 					my $message = 'null';
-					my %base_keys = (STATUS => 1, MESSAGE => 1, DHREF => 1);
+					my %base_keys = (STATUS => 1, MESSAGE => 1, DHREF => undef, INTRGR => 1);
 					foreach my $bkey (keys %base_keys) {
 						if(!$base_keys{$bkey}) { next; }
 						if($bkey=~/STATUS/) {
@@ -1720,6 +1730,10 @@ sub _toWx {
 						if($bkey=~/MESSAGE/) {
 							$message = $self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE};
 							delete $self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE};
+						}
+						if($bkey=~/INTRGR/) {
+							$integer = $self->{WXFRAMEIO_RESULTS}->{$key}->{INTRGR};
+							delete $self->{WXFRAMEIO_RESULTS}->{$key}->{INTRGR};
 						}
 						if($bkey=~/DHREF/) {
 							$dhref = $self->{WXFRAMEIO_RESULTS}->{$key}->{DHREF};
@@ -1734,7 +1748,20 @@ sub _toWx {
 					}
 					my $wxframe_obj = $self->{WX_MAIN_APP}->getWxFramePtr($wxframe);
 					if( my $ref = eval { $wxframe_obj->can($evt_up) } ) {
-						$wxframe_obj->$evt_up( $sigkey, $sigvalue, $status, $message, $dhref );
+						my @_args = ();
+						my %args = (sigkey => $sigkey, sigvalue => $sigvalue, status => $status, text => $message, int_ctr => $integer, dhref => $dhref);
+						my %checks = (int_ctr => 1, dhref => 1);
+						foreach my $mkey (keys %$args) {
+							if(exists $checks{$mkey} and $checks{$mkey}) {
+								if(!defined $args->{$mkey} or !$args->{$mkey}) {
+									next;
+								}
+							}
+							push @_args, $mkey;
+							push @_args, $args->{$mkey};
+						}
+						$wxframe_obj->$evt_up( @_args );
+#						$wxframe_obj->$evt_up( $sigkey, $sigvalue, $status, $message, $dhref );
 					}
 				}
 				return 1;
@@ -1748,14 +1775,19 @@ sub _toWx {
 
 				my $key = $sigkey . "_" . $sigvalue; ## avoiding potential '0' keys
 				my $status = 0;
+				my $integer = 0;
 				my $dhref = undef;
 				my $message = 'null';
-				my %base_keys = (STATUS => 1, MESSAGE => 0, DHREF => undef);
+				my %base_keys = (STATUS => 1, MESSAGE => 0, DHREF => undef, INTRGR => 1);
 				foreach my $bkey (keys %base_keys) {
 						if(!$base_keys{$bkey}) { next; }
 						if($bkey=~/STATUS/) {
 							$status = $self->{WXFRAMEIO_RESULTS}->{$key}->{STATUS};
 							delete $self->{WXFRAMEIO_RESULTS}->{$key}->{STATUS};
+						}
+						if($bkey=~/INTRGR/) {
+							$integer = $self->{WXFRAMEIO_RESULTS}->{$key}->{INTRGR};
+							delete $self->{WXFRAMEIO_RESULTS}->{$key}->{INTRGR};
 						}
 						if($bkey=~/MESSAGE/) {
 							$message = $self->{WXFRAMEIO_RESULTS}->{$key}->{MESSAGE};
@@ -1783,7 +1815,20 @@ sub _toWx {
 				}
 				my $wxframe_obj = $self->{WX_MAIN_APP}->getWxFramePtr($wxframe);
 				if( my $ref = eval { $wxframe_obj->can($evt_meth) } ) {
-					$wxframe_obj->$evt_meth( $sigkey, $sigvalue, $status, $dhref, $message, );
+						my @_args = ();
+						my %args = (sigkey => $sigkey, sigvalue => $sigvalue, status => $status, text => $message, int_ctr => $integer, dhref => $dhref);
+						my %checks = (int_ctr => 1, dhref => 1);
+						foreach my $mkey (keys %$args) {
+							if(exists $checks{$mkey} and $checks{$mkey}) {
+								if(!defined $args->{$mkey} or !$args->{$mkey}) {
+									next;
+								}
+							}
+							push @_args, $mkey;
+							push @_args, $args->{$mkey};
+						}
+						$wxframe_obj->$evt_meth( @_args );
+#					$wxframe_obj->$evt_meth( $sigkey, $sigvalue, $status, $dhref, $message, );
 				} else {
 					if ( $self->{CROAK_ON_ERROR} ) {
 						my $message = "[WXPOEIO TO-WX] Opps! No valid event method [$evt_meth] defined within wxFrame for sigkey[$sigkey]";
